@@ -1,0 +1,54 @@
+# app/utils/auth.py (安全升级版)
+
+import streamlit as st
+import bcrypt
+import logging
+from .database import execute_query # 使用相对导入
+
+logging.basicConfig(level=logging.INFO)
+
+def hash_password(password: str) -> str:
+    """使用 bcrypt 对密码进行哈希处理，返回字符串格式的哈希值"""
+    password_bytes = password.encode('utf-8')
+    salt = bcrypt.gensalt()
+    hashed_bytes = bcrypt.hashpw(password_bytes, salt)
+    return hashed_bytes.decode('utf-8')
+
+def verify_password(password: str, hashed_password: str) -> bool:
+    """使用 bcrypt 验证密码和哈希值是否匹配"""
+    password_bytes = password.encode('utf-8')
+    hashed_password_bytes = hashed_password.encode('utf-8')
+    return bcrypt.checkpw(password_bytes, hashed_password_bytes)
+
+def login_user(username: str, password: str) -> dict | None:
+    """
+    验证用户登录。
+    成功则返回包含用户信息的字典，失败则返回None。
+    """
+    if not username or not password:
+        return None
+
+    try:
+        # 在我们的新模型中，用户表没有 'is_active' 字段，所以移除了这个检查
+        # 同样，我们直接在User模型中定义了role，所以不需要再JOIN roles表
+        query = "SELECT id, username, password_hash, role FROM users WHERE username = %s"
+        user_data = execute_query(query, params=(username,), fetch_one=True)
+
+        if user_data and verify_password(password, user_data['password_hash']):
+            logging.info(f"用户 {username} 登录成功")
+            # 返回一个符合主程序期望的字典
+            return {
+                'user_id': user_data['id'],
+                'username': user_data['username'],
+                'role': user_data['role']
+            }
+        else:
+            logging.warning(f"用户 {username} 登录失败：用户名或密码错误")
+            return None
+
+    except Exception as e:
+        logging.error(f"登录验证过程中发生数据库错误: {e}")
+        st.error("登录时发生内部错误，请联系管理员。")
+        return None
+
+# 你可以根据需要，在这里继续添加其他与认证、权限相关的辅助函数...

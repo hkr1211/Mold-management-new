@@ -1,0 +1,422 @@
+﻿import streamlit as st
+import pandas as pd
+import psycopg2
+import os
+from datetime import datetime, date
+
+def get_db_connection():
+    """获取数据库连接"""
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv('DB_HOST', 'postgres'),
+            database=os.getenv('DB_NAME', 'mold_management'),
+            user=os.getenv('DB_USER', 'mold_user'),
+            password=os.getenv('DB_PASSWORD', 'mold_password_123'),
+            port=os.getenv('DB_PORT', '5432')
+        )
+        return conn
+    except Exception as e:
+        st.error(f"数据库连接失败: {e}")
+        return None
+
+def load_molds():
+    """加载模具列表"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            query = """
+            SELECT 
+                m.mold_id,
+                m.mold_code,
+                m.mold_name,
+                mft.type_name as mold_type,
+                ms.status_name as current_status,
+                ms.status_color,
+                sl.location_name as current_location,
+                m.accumulated_strokes,
+                m.theoretical_lifespan_strokes,
+                CASE 
+                    WHEN m.theoretical_lifespan_strokes > 0 THEN 
+                        ROUND((m.accumulated_strokes::DECIMAL / m.theoretical_lifespan_strokes * 100), 2)
+                    ELSE 0 
+                END as usage_percentage,
+                m.has_coating,
+                m.priority_level,
+                m.manufacturer,
+                m.entry_date,
+                m.remarks
+            FROM molds m
+            LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
+            LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+            LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+            ORDER BY m.mold_code
+            """
+            
+            df = pd.read_sql(query, conn)
+            conn.close()
+            return df
+        except Exception as e:
+            st.error(f"加载模具列表失败: {e}")
+            conn.close()
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+def load_dropdown_data():
+    """加载下拉选项数据"""
+    conn = get_db_connection()
+    if not conn:
+        return {}, {}, {}
+    
+    try:
+        # 加载模具类型
+        types_df = pd.read_sql("SELECT type_id, type_name FROM mold_functional_types ORDER BY type_id", conn)
+        types_dict = dict(zip(types_df['type_id'], types_df['type_name']))
+        
+        # 加载模具状态
+        statuses_df = pd.read_sql("SELECT status_id, status_name FROM mold_statuses ORDER BY status_id", conn)
+        statuses_dict = dict(zip(statuses_df['status_id'], statuses_df['status_name']))
+        
+        # 加载存放位置
+        locations_df = pd.read_sql("SELECT location_id, location_name FROM storage_locations ORDER BY location_id", conn)
+        locations_dict = dict(zip(locations_df['location_id'], locations_df['location_name']))
+        
+        conn.close()
+        return types_dict, statuses_dict, locations_dict
+    except Exception as e:
+        st.error(f"加载基础数据失败: {e}")
+        conn.close()
+        return {}, {}, {}
+
+def add_new_mold(mold_data):
+    """添加新模具到数据库"""
+    conn = get_db_connection()
+    if not conn:
+        return False, "数据库连接失败"
+    
+    try:
+        cursor = conn.cursor()
+        
+        query = """
+        INSERT INTO molds (
+            mold_code, mold_name, mold_functional_type_id,
+            manufacturer, current_status_id, current_location_id, 
+            theoretical_lifespan_strokes, maintenance_cycle_strokes,
+            has_coating, priority_level, remarks
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        
+        cursor.execute(query, (
+            mold_data['mold_code'],
+            mold_data['mold_name'],
+            mold_data['mold_type_id'],
+            mold_data.get('manufacturer'),
+            mold_data['status_id'],
+            mold_data.get('location_id'),
+            mold_data.get('theoretical_lifespan'),
+            mold_data.get('maintenance_cycle'),
+            mold_data.get('has_coating', False),
+            mold_data.get('priority_level', 3),
+            mold_data.get('remarks')
+        ))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True, "模具添加成功！"
+        
+    except psycopg2.IntegrityError as e:
+        conn.rollback()
+        cursor.close()
+        conn.close()
+        if "duplicate key" in str(e):
+            return False, "模具编号已存在，请使用其他编号！"
+        return False, f"数据完整性错误: {e}"
+    except Exception as e:
+        conn.rollback()
+        cursor.close()
+        conn.close()
+        return False, f"添加失败: {e}"
+
+def show_mold_management():
+    """显示模具管理界面"""
+    st.header("🔧 模具管理")
+    
+    # 显示系统状态
+    col1, col2, col3, col4 = st.columns(4)
+    
+    # 加载模具数据获取统计信息
+    df_molds = load_molds()
+    
+    with col1:
+        st.metric("模具总数", len(df_molds))
+    with col2:
+        if not df_molds.empty:
+            idle_count = len(df_molds[df_molds['current_status'] == '闲置'])
+            st.metric("闲置模具", idle_count)
+        else:
+            st.metric("闲置模具", 0)
+    with col3:
+        if not df_molds.empty:
+            avg_usage = df_molds['usage_percentage'].mean()
+            st.metric("平均使用率", f"{avg_usage:.1f}%")
+        else:
+            st.metric("平均使用率", "0%")
+    with col4:
+        if not df_molds.empty:
+            coating_count = df_molds['has_coating'].sum()
+            st.metric("涂层模具", f"{coating_count}个")
+        else:
+            st.metric("涂层模具", "0个")
+    
+    st.markdown("---")
+    
+    # 创建标签页
+    tab1, tab2, tab3 = st.tabs(["📋 模具列表", "➕ 新增模具", "📊 数据分析"])
+    
+    with tab1:
+        show_mold_list(df_molds)
+    
+    with tab2:
+        show_add_mold_form()
+    
+    with tab3:
+        show_data_analysis(df_molds)
+
+def show_mold_list(df_molds):
+    """显示模具列表"""
+    st.subheader("📋 模具列表")
+    
+    if df_molds.empty:
+        st.info("💡 暂无模具数据，请在'新增模具'标签页中添加模具信息。")
+        return
+    
+    # 搜索和筛选
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        search_code = st.text_input("🔍 搜索模具编号", placeholder="输入编号关键词...")
+    with col2:
+        search_name = st.text_input("🔍 搜索模具名称", placeholder="输入名称关键词...")
+    with col3:
+        status_filter = st.selectbox("筛选状态", ["全部"] + df_molds['current_status'].unique().tolist())
+    
+    # 应用搜索和筛选
+    filtered_df = df_molds.copy()
+    
+    if search_code:
+        filtered_df = filtered_df[filtered_df['mold_code'].str.contains(search_code, case=False, na=False)]
+    
+    if search_name:
+        filtered_df = filtered_df[filtered_df['mold_name'].str.contains(search_name, case=False, na=False)]
+    
+    if status_filter != "全部":
+        filtered_df = filtered_df[filtered_df['current_status'] == status_filter]
+    
+    st.write(f"找到 **{len(filtered_df)}** 个模具")
+    
+    if filtered_df.empty:
+        st.warning("没有找到匹配的模具")
+        return
+    
+    # 格式化显示数据
+    display_df = filtered_df.copy()
+    
+    # 添加状态颜色标识
+    def format_status(row):
+        color_map = {
+            '闲置': '🟢',
+            '使用中': '🔵', 
+            '已借出': '🟡',
+            '维修中': '🔴',
+            '保养中': '🟠',
+            '待维修': '🔴',
+            '报废': '⚫'
+        }
+        return f"{color_map.get(row['current_status'], '⚪')} {row['current_status']}"
+    
+    display_df['状态'] = display_df.apply(format_status, axis=1)
+    display_df['使用率'] = display_df['usage_percentage'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "0%")
+    display_df['涂层'] = display_df['has_coating'].apply(lambda x: "✅" if x else "❌")
+    
+    # 选择要显示的列
+    columns_to_show = ['mold_code', 'mold_name', 'mold_type', '状态', 'current_location', '使用率', '涂层', 'manufacturer']
+    column_names = {
+        'mold_code': '模具编号',
+        'mold_name': '模具名称',
+        'mold_type': '类型',
+        'current_location': '位置',
+        'manufacturer': '制作人'
+    }
+    
+    final_df = display_df[columns_to_show].rename(columns=column_names)
+    
+    # 显示表格
+    st.dataframe(
+        final_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "使用率": st.column_config.ProgressColumn(
+                "使用率",
+                help="模具寿命使用百分比",
+                format="%.1f%%",
+                min_value=0,
+                max_value=100,
+            ),
+        }
+    )
+    
+    # 详细信息展示
+    with st.expander("📄 查看模具详细信息"):
+        if len(filtered_df) > 0:
+            selected_mold_code = st.selectbox(
+                "选择模具",
+                options=filtered_df['mold_code'].tolist(),
+                format_func=lambda x: f"{x} - {filtered_df[filtered_df['mold_code']==x]['mold_name'].iloc[0]}"
+            )
+            
+            if selected_mold_code:
+                mold_detail = filtered_df[filtered_df['mold_code'] == selected_mold_code].iloc[0]
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**🔧 基本信息**")
+                    st.write(f"**模具编号**: {mold_detail['mold_code']}")
+                    st.write(f"**模具名称**: {mold_detail['mold_name']}")
+                    st.write(f"**模具类型**: {mold_detail['mold_type']}")
+                    st.write(f"**制作人**: {mold_detail['manufacturer'] or '未指定'}")
+                    st.write(f"**入账日期**: {mold_detail['entry_date']}")
+                    
+                with col2:
+                    st.write("**📊 状态信息**")
+                    st.write(f"**当前状态**: {mold_detail['current_status']}")
+                    st.write(f"**存放位置**: {mold_detail['current_location'] or '未指定'}")
+                    st.write(f"**累计冲次**: {mold_detail['accumulated_strokes']:,}")
+                    st.write(f"**理论寿命**: {mold_detail['theoretical_lifespan_strokes']:,}" if pd.notna(mold_detail['theoretical_lifespan_strokes']) else "**理论寿命**: 未设置")
+                    st.write(f"**使用率**: {mold_detail['usage_percentage']:.1f}%")
+                
+                if mold_detail['remarks']:
+                    st.write("**📝 备注**")
+                    st.write(mold_detail['remarks'])
+
+def show_add_mold_form():
+    """显示新增模具表单"""
+    st.subheader("➕ 新增模具")
+    
+    # 加载下拉选项数据
+    types_dict, statuses_dict, locations_dict = load_dropdown_data()
+    
+    if not types_dict or not statuses_dict:
+        st.error("❌ 无法加载基础数据，请检查数据库连接")
+        return
+    
+    with st.form("add_mold_form", clear_on_submit=True):
+        st.write("**📝 基本信息**")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            mold_code = st.text_input("模具编号 *", placeholder="例如: MD004", help="必填项，模具的唯一标识")
+            mold_name = st.text_input("模具名称 *", placeholder="例如: Φ60钛平底杯落料模", help="必填项")
+            mold_type_id = st.selectbox("模具类型 *", options=list(types_dict.keys()), format_func=lambda x: types_dict[x], help="选择模具的功能类型")
+            
+        with col2:
+            manufacturer = st.text_input("制作人", placeholder="例如: 模具工张师傅")
+            status_id = st.selectbox("初始状态 *", options=list(statuses_dict.keys()), format_func=lambda x: statuses_dict[x], index=0)
+            location_id = st.selectbox("存放位置", options=[None] + list(locations_dict.keys()), format_func=lambda x: "请选择..." if x is None else locations_dict[x])
+        
+        st.write("**⚙️ 技术参数**")
+        col3, col4 = st.columns(2)
+        
+        with col3:
+            theoretical_lifespan = st.number_input("理论寿命(冲次)", min_value=0, value=100000, step=1000, help="模具的预期使用寿命")
+            maintenance_cycle = st.number_input("保养周期(冲次)", min_value=0, value=5000, step=500, help="多少冲次后需要保养")
+            
+        with col4:
+            priority_level = st.slider("优先级", min_value=1, max_value=5, value=3, help="1=最低优先级, 5=最高优先级")
+            has_coating = st.checkbox("是否有涂层", help="模具表面是否有保护涂层")
+        
+        st.write("**📄 其他信息**")
+        remarks = st.text_area("备注", placeholder="可选的备注信息...", help="记录模具的特殊说明或注意事项")
+        
+        # 提交按钮
+        col_submit1, col_submit2, col_submit3 = st.columns([1, 2, 1])
+        with col_submit2:
+            submitted = st.form_submit_button("💾 保存模具信息", use_container_width=True, type="primary")
+        
+        if submitted:
+            # 验证必填项
+            if not mold_code or not mold_name:
+                st.error("❌ 请填写模具编号和模具名称！")
+            else:
+                # 准备数据
+                mold_data = {
+                    'mold_code': mold_code.strip(),
+                    'mold_name': mold_name.strip(),
+                    'mold_type_id': mold_type_id,
+                    'manufacturer': manufacturer.strip() if manufacturer else None,
+                    'status_id': status_id,
+                    'location_id': location_id,
+                    'theoretical_lifespan': theoretical_lifespan if theoretical_lifespan > 0 else None,
+                    'maintenance_cycle': maintenance_cycle if maintenance_cycle > 0 else None,
+                    'has_coating': has_coating,
+                    'priority_level': priority_level,
+                    'remarks': remarks.strip() if remarks else None
+                }
+                
+                # 添加模具
+                success, message = add_new_mold(mold_data)
+                
+                if success:
+                    st.success(f"✅ {message}")
+                    st.balloons()
+                    st.info("💡 暂无模具数据，请在'新增模具'标签页中添加模具信息。")
+                else:
+                    st.error(f"❌ {message}")
+
+def show_data_analysis(df_molds):
+    """显示数据分析"""
+    st.subheader("📊 数据分析")
+    
+    if df_molds.empty:
+        st.info('暂无数据可分析')
+        return
+    
+    # 状态分布
+    st.write("**模具状态分布**")
+    status_counts = df_molds['current_status'].value_counts()
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.bar_chart(status_counts)
+    
+    with col2:
+        for status, count in status_counts.items():
+            percentage = (count / len(df_molds)) * 100
+            st.write(f"**{status}**: {count}个 ({percentage:.1f}%)")
+    
+    st.markdown("---")
+    
+    # 类型分布
+    st.write("**模具类型分布**")
+    type_counts = df_molds['mold_type'].value_counts()
+    st.bar_chart(type_counts)
+    
+    st.markdown("---")
+    
+    # 使用率分析
+    if not df_molds['usage_percentage'].isna().all():
+        st.write("**使用率分析**")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            avg_usage = df_molds['usage_percentage'].mean()
+            st.metric("平均使用率", f"{avg_usage:.1f}%")
+        
+        with col2:
+            max_usage = df_molds['usage_percentage'].max()
+            st.metric("最高使用率", f"{max_usage:.1f}%")
+        
+        with col3:
+            high_usage_count = len(df_molds[df_molds['usage_percentage'] > 80])
+            st.metric("高使用率模具", f"{high_usage_count}个", help="使用率超过80%的模具")

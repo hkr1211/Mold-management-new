@@ -1,0 +1,512 @@
+# main.py - 修复版本
+import streamlit as st
+import sys
+import os
+from pathlib import Path
+
+# 添加项目根目录到Python路径
+project_root = Path(__file__).parent
+sys.path.append(str(project_root))
+
+# 安全导入页面模块
+def safe_import_modules():
+    """安全导入所有页面模块"""
+    modules = {}
+    
+    try:
+        from pages import mold_management
+        modules['mold_management'] = mold_management
+        st.sidebar.success("✅ 模具管理模块已加载")
+    except ImportError as e:
+        st.sidebar.error(f"❌ 模具管理模块加载失败: {e}")
+        modules['mold_management'] = None
+    
+    try:
+        from pages import loan_management
+        modules['loan_management'] = loan_management
+        st.sidebar.success("✅ 借用管理模块已加载")
+    except ImportError as e:
+        st.sidebar.error(f"❌ 借用管理模块加载失败: {e}")
+        modules['loan_management'] = None
+    
+    try:
+        from pages import maintenance_management
+        modules['maintenance_management'] = maintenance_management
+        st.sidebar.success("✅ 维修保养模块已加载")
+    except ImportError as e:
+        st.sidebar.error(f"❌ 维修保养模块加载失败: {e}")
+        modules['maintenance_management'] = None
+    
+    return modules
+
+# 导入工具模块
+try:
+    from utils.database import test_connection
+    from utils.auth import authenticate_user, logout_user
+except ImportError as e:
+    st.error(f"工具模块导入失败: {e}")
+    st.stop()
+
+# 页面配置
+st.set_page_config(
+    page_title="蕴杰金属模具管理系统",
+    page_icon="🔧",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# 自定义CSS样式
+st.markdown("""
+<style>
+    .main-header {
+        padding: 1rem 0;
+        background: linear-gradient(90deg, #1f77b4, #ff7f0e);
+        color: white;
+        text-align: center;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+    }
+    
+    .metric-card {
+        background: #f0f2f6;
+        padding: 1rem;
+        border-radius: 10px;
+        border-left: 4px solid #1f77b4;
+    }
+    
+    .sidebar .sidebar-content {
+        background: linear-gradient(180deg, #f0f2f6, #ffffff);
+    }
+    
+    .status-indicator {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 5px;
+    }
+    
+    .status-available { background-color: #28a745; }
+    .status-in-use { background-color: #ffc107; }
+    .status-maintenance { background-color: #dc3545; }
+    
+    .quick-action-btn {
+        width: 100%;
+        margin: 0.25rem 0;
+        padding: 0.5rem;
+        border-radius: 5px;
+        border: 1px solid #ddd;
+        background: white;
+        cursor: pointer;
+        transition: all 0.3s;
+    }
+    
+    .quick-action-btn:hover {
+        background: #f8f9fa;
+        border-color: #1f77b4;
+    }
+    
+    .error-container {
+        background-color: #fff3cd;
+        border: 1px solid #ffeaa7;
+        border-radius: 5px;
+        padding: 1rem;
+        margin: 1rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+def show_login_page():
+    """显示登录页面"""
+    # 居中显示登录表单
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("""
+        <div style="text-align: center; padding: 2rem;">
+            <h1>🔧 蕴杰金属模具管理系统</h1>
+            <p style="color: #666; font-size: 1.1em;">Metal Stamping Die Management System</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # 登录表单
+        with st.form("login_form"):
+            st.markdown("### 🔐 用户登录")
+            
+            username = st.text_input("用户名", placeholder="请输入用户名")
+            password = st.text_input("密码", type="password", placeholder="请输入密码")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                login_button = st.form_submit_button("登录", type="primary", use_container_width=True)
+            with col2:
+                if st.form_submit_button("测试连接", use_container_width=True):
+                    if test_connection():
+                        st.success("✅ 数据库连接正常")
+                    else:
+                        st.error("❌ 数据库连接失败")
+            
+            if login_button:
+                if username and password:
+                    user_info = authenticate_user(username, password)
+                    if user_info:
+                        # 保存用户信息到session
+                        st.session_state.logged_in = True
+                        st.session_state.user_id = user_info['user_id']
+                        st.session_state.username = user_info['username']
+                        st.session_state.full_name = user_info['full_name']
+                        st.session_state.user_role = user_info['role_name']
+                        st.success(f"欢迎，{user_info['full_name']}！")
+                        st.rerun()
+                    else:
+                        st.error("❌ 用户名或密码错误")
+                else:
+                    st.warning("⚠️ 请输入用户名和密码")
+        
+        # 添加默认账户说明
+        with st.expander("💡 默认测试账户", expanded=False):
+            st.markdown("""
+            **测试账户信息:**
+            
+            🔧 **超级管理员**
+            - 用户名: `admin` 
+            - 密码: `admin123`
+            
+            📋 **模具库管理员**
+            - 用户名: `mold_admin` 
+            - 密码: `mold123`
+            
+            🛠️ **模具工**
+            - 用户名: `technician` 
+            - 密码: `tech123`
+            
+            ⚡ **冲压操作工**
+            - 用户名: `operator` 
+            - 密码: `op123`
+            
+            *注: 首次使用前请确保已运行数据库初始化脚本*
+            """)
+
+def show_sidebar(modules):
+    """显示侧边栏导航"""
+    with st.sidebar:
+        # 用户信息
+        st.markdown(f"""
+        <div style="padding: 1rem; background: #f0f8ff; border-radius: 10px; margin-bottom: 1rem;">
+            <h4>👤 {st.session_state.full_name}</h4>
+            <p style="margin: 0; color: #666;">
+                角色: {st.session_state.user_role}<br>
+                用户名: {st.session_state.username}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # 模块加载状态
+        with st.expander("📊 系统状态", expanded=False):
+            total_modules = len(modules)
+            loaded_modules = sum(1 for module in modules.values() if module is not None)
+            st.write(f"模块加载状态: {loaded_modules}/{total_modules}")
+            
+            for name, module in modules.items():
+                status = "✅" if module else "❌"
+                display_name = name.replace('_', ' ').title()
+                st.write(f"{status} {display_name}")
+        
+        # 快速操作
+        st.markdown("### ⚡ 快速操作")
+        
+        user_role = st.session_state.get('user_role', '')
+        
+        # 根据角色显示不同的快速操作
+        if user_role in ['超级管理员', '模具库管理员']:
+            if modules['mold_management']:
+                if st.button("📋 查看模具列表", use_container_width=True):
+                    st.session_state.current_page = "模具管理"
+                    st.rerun()
+            
+            if modules['loan_management']:
+                if st.button("📋 借用管理", use_container_width=True):
+                    st.session_state.current_page = "借用管理"
+                    st.rerun()
+            
+            if modules['maintenance_management']:
+                if st.button("🔧 维修管理", use_container_width=True):
+                    st.session_state.current_page = "维修保养"
+                    st.rerun()
+        
+        elif user_role == '模具工':
+            if modules['maintenance_management']:
+                if st.button("🔧 维修概览", use_container_width=True):
+                    st.session_state.current_page = "维修保养"
+                    st.rerun()
+        
+        elif user_role == '冲压操作工':
+            if modules['mold_management']:
+                if st.button("🔍 模具查询", use_container_width=True):
+                    st.session_state.current_page = "模具查询"
+                    st.rerun()
+            
+            if modules['loan_management']:
+                if st.button("📝 借用申请", use_container_width=True):
+                    st.session_state.current_page = "借用管理"
+                    st.rerun()
+        
+        st.markdown("---")
+        
+        # 导航菜单
+        st.markdown("### 📂 功能导航")
+        
+        # 根据角色和模块可用性显示不同的导航选项
+        available_pages = {}
+        
+        if user_role in ['超级管理员', '模具库管理员']:
+            available_pages["🏠 首页"] = "首页"
+            
+            if modules['mold_management']:
+                available_pages["📋 模具管理"] = "模具管理"
+            
+            if modules['loan_management']:
+                available_pages["🛠️ 借用管理"] = "借用管理"
+            
+            if modules['maintenance_management']:
+                available_pages["🔧 维修保养"] = "维修保养"
+            
+            available_pages["📊 统计报表"] = "统计报表"
+            available_pages["⚙️ 系统管理"] = "系统管理"
+            
+        elif user_role == '模具工':
+            available_pages["🏠 首页"] = "首页"
+            
+            if modules['mold_management']:
+                available_pages["📋 模具查询"] = "模具查询"
+            
+            if modules['maintenance_management']:
+                available_pages["🔧 维修保养"] = "维修保养"
+                
+        elif user_role == '冲压操作工':
+            available_pages["🏠 首页"] = "首页"
+            
+            if modules['mold_management']:
+                available_pages["🔍 模具查询"] = "模具查询"
+            
+            if modules['loan_management']:
+                available_pages["🛠️ 借用管理"] = "借用管理"
+        else:
+            available_pages = {"🏠 首页": "首页"}
+        
+        # 显示导航按钮
+        for page_label, page_name in available_pages.items():
+            if st.button(page_label, use_container_width=True):
+                st.session_state.current_page = page_name
+                st.rerun()
+        
+        st.markdown("---")
+        
+        # 系统信息
+        st.markdown("### ℹ️ 系统信息")
+        st.info(f"""
+        **系统版本:** v1.0.0  
+        **数据库:** PostgreSQL  
+        **框架:** Streamlit  
+        **部署方式:** Docker
+        """)
+        
+        # 退出登录
+        if st.button("🚪 退出登录", type="secondary", use_container_width=True):
+            logout_user()
+            st.rerun()
+
+def show_home_page():
+    """显示首页"""
+    # 主标题
+    st.markdown("""
+    <div class="main-header">
+        <h1>🔧 蕴杰金属冲压模具管理系统</h1>
+        <p>Metal Stamping Die Management System</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    user_role = st.session_state.get('user_role', '')
+    
+    # 根据角色显示不同的首页内容
+    if user_role in ['超级管理员', '模具库管理员']:
+        show_admin_dashboard()
+    elif user_role == '模具工':
+        show_technician_dashboard()
+    elif user_role == '冲压操作工':
+        show_operator_dashboard()
+    else:
+        st.warning("未知用户角色")
+
+def show_admin_dashboard():
+    """管理员仪表板"""
+    st.subheader("📊 管理概览")
+    
+    try:
+        from utils.database import execute_query
+        
+        # 简化的统计信息
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("系统状态", "运行中", help="系统运行状态")
+        
+        with col2:
+            st.metric("在线用户", "1", help="当前在线用户数")
+        
+        with col3:
+            st.metric("数据库", "正常", help="数据库连接状态")
+        
+        with col4:
+            st.metric("服务", "可用", help="服务可用性状态")
+        
+        # 功能说明
+        st.markdown("---")
+        st.subheader("📋 系统功能")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("""
+            **📋 模具管理**
+            - 模具信息查询
+            - 模具状态管理
+            - 模具详情展示
+            """)
+        
+        with col2:
+            st.markdown("""
+            **🛠️ 借用管理**
+            - 借用申请处理
+            - 审批流程管理
+            - 借用状态跟踪
+            """)
+        
+        with col3:
+            st.markdown("""
+            **🔧 维修保养**
+            - 维修记录管理
+            - 保养计划制定
+            - 统计分析报表
+            """)
+    
+    except Exception as e:
+        st.error(f"加载仪表板数据失败: {e}")
+
+def show_technician_dashboard():
+    """模具工仪表板"""
+    st.subheader("🔧 维修工作台")
+    
+    st.info("欢迎使用维修工作台，您可以在这里管理维修保养任务。")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.metric("待处理任务", "0", help="当前待处理的维修任务")
+    
+    with col2:
+        st.metric("本月完成", "0", help="本月完成的维修任务")
+
+def show_operator_dashboard():
+    """冲压操作工仪表板"""
+    st.subheader("⚡ 操作工作台")
+    
+    st.info("欢迎使用操作工作台，您可以在这里查询模具信息和申请借用。")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.metric("我的申请", "0", help="我提交的借用申请数量")
+    
+    with col2:
+        st.metric("可用模具", "0", help="当前可借用的模具数量")
+
+def show_module_unavailable(module_name):
+    """显示模块不可用页面"""
+    st.error(f"❌ {module_name} 模块当前不可用")
+    st.markdown("""
+    ### 可能的原因：
+    1. 模块文件不存在或有语法错误
+    2. 缺少必要的依赖
+    3. 数据库连接问题
+    
+    ### 解决方法：
+    1. 检查文件是否存在：`pages/{module_name.lower().replace(' ', '_')}.py`
+    2. 查看控制台错误日志
+    3. 重启应用服务
+    """)
+
+def main():
+    """主函数"""
+    # 初始化session state
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+    
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = "首页"
+    
+    # 检查登录状态
+    if not st.session_state.logged_in:
+        show_login_page()
+        return
+    
+    # 安全导入模块
+    modules = safe_import_modules()
+    
+    # 显示侧边栏
+    show_sidebar(modules)
+    
+    # 根据选择的页面显示内容
+    page = st.session_state.current_page
+    
+    try:
+        if page == "首页":
+            show_home_page()
+        
+        elif page == "模具管理":
+            if modules['mold_management']:
+                modules['mold_management'].show()
+            else:
+                show_module_unavailable("模具管理")
+        
+        elif page == "模具查询":
+            if modules['mold_management']:
+                # 为冲压操作工提供只读的模具查询界面
+                if hasattr(modules['mold_management'], 'show_mold_list_readonly'):
+                    modules['mold_management'].show_mold_list_readonly()
+                else:
+                    modules['mold_management'].show()
+            else:
+                show_module_unavailable("模具查询")
+        
+        elif page == "借用管理":
+            if modules['loan_management']:
+                modules['loan_management'].show()
+            else:
+                show_module_unavailable("借用管理")
+        
+        elif page == "维修保养":
+            if modules['maintenance_management']:
+                modules['maintenance_management'].show()
+            else:
+                show_module_unavailable("维修保养")
+        
+        elif page == "统计报表":
+            st.title("📊 统计报表")
+            st.info("统计报表模块开发中...")
+        
+        elif page == "系统管理":
+            st.title("⚙️ 系统管理")
+            st.info("系统管理模块开发中...")
+        
+        else:
+            st.error(f"页面 '{page}' 不存在")
+            st.session_state.current_page = "首页"
+            st.rerun()
+    
+    except Exception as e:
+        st.error(f"页面加载失败: {e}")
+        st.exception(e)
+
+if __name__ == "__main__":
+    main()

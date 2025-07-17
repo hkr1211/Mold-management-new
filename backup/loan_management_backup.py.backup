@@ -1,0 +1,817 @@
+# pages/loan_management.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from utils.database import (
+    execute_query, get_all_molds, get_mold_by_id,
+    get_loan_statuses, get_users, convert_numpy_types
+)
+
+def create_loan_application():
+    """创建借用申请"""
+    st.subheader("📝 新建借用申请")
+    
+    # 获取当前用户信息
+    current_user_id = st.session_state.get('user_id')
+    current_user_role = st.session_state.get('user_role')
+    
+    # 获取可借用的模具（状态为闲置的）
+    query = """
+    SELECT 
+        m.mold_id,
+        m.mold_code,
+        m.mold_name,
+        mft.type_name as functional_type,
+        ms.status_name as current_status,
+        sl.location_name as current_location
+    FROM molds m
+    LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
+    LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+    LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+    WHERE ms.status_name = '闲置'
+    ORDER BY m.mold_code
+    """
+    
+    available_molds = execute_query(query)
+    
+    if not available_molds:
+        st.warning("当前没有可借用的模具")
+        return
+    
+    # 创建申请表单
+    with st.form("loan_application_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # 选择模具
+            mold_options = {f"{m['mold_code']} - {m['mold_name']}": m['mold_id'] 
+                          for m in available_molds}
+            selected_mold = st.selectbox(
+                "选择模具",
+                options=list(mold_options.keys()),
+                help="只显示当前闲置状态的模具"
+            )
+            
+            # 使用设备
+            destination_equipment = st.text_input(
+                "使用设备",
+                placeholder="请输入设备编号或名称"
+            )
+            
+        with col2:
+            # 预计使用时长
+            use_duration = st.selectbox(
+                "预计使用时长",
+                options=["4小时", "8小时", "1天", "2天", "3天", "1周", "其他"],
+                index=1
+            )
+            
+            # 如果选择其他，显示自定义输入
+            if use_duration == "其他":
+                custom_days = st.number_input("自定义天数", min_value=1, max_value=30, value=1)
+                expected_return = datetime.now() + timedelta(days=custom_days)
+            else:
+                # 根据选择计算预计归还时间
+                duration_map = {
+                    "4小时": timedelta(hours=4),
+                    "8小时": timedelta(hours=8),
+                    "1天": timedelta(days=1),
+                    "2天": timedelta(days=2),
+                    "3天": timedelta(days=3),
+                    "1周": timedelta(days=7)
+                }
+                expected_return = datetime.now() + duration_map.get(use_duration, timedelta(days=1))
+            
+            # 显示预计归还时间
+            st.date_input("预计归还日期", value=expected_return.date(), disabled=True)
+        
+        # 生产任务说明
+        production_task = st.text_area(
+            "生产任务说明",
+            placeholder="请描述生产任务、产品信息、预计生产数量等",
+            height=100
+        )
+        
+        # 备注
+        remarks = st.text_area(
+            "备注",
+            placeholder="其他需要说明的信息",
+            height=60
+        )
+        
+        # 提交按钮
+        submitted = st.form_submit_button("提交申请", type="primary", use_container_width=True)
+        
+        if submitted:
+            if not destination_equipment:
+                st.error("请填写使用设备")
+            elif not production_task:
+                st.error("请填写生产任务说明")
+            else:
+                # 提交申请到数据库
+                mold_id = convert_numpy_types(mold_options[selected_mold])
+                
+                # 获取待审批状态ID
+                status_query = "SELECT status_id FROM loan_statuses WHERE status_name = '待审批'"
+                status_result = execute_query(status_query)
+                if not status_result:
+                    st.error("系统错误：找不到借用状态")
+                    return
+                
+                status_id = status_result[0]['status_id']
+                
+                # 插入借用记录
+                insert_query = """
+                INSERT INTO mold_loan_records (
+                    mold_id, applicant_id, application_timestamp,
+                    expected_return_timestamp, loan_status_id,
+                    destination_equipment, remarks
+                ) VALUES (%s, %s, NOW(), %s, %s, %s, %s)
+                RETURNING loan_id
+                """
+                
+                combined_remarks = f"生产任务: {production_task}"
+                if remarks:
+                    combined_remarks += f"\n备注: {remarks}"
+                
+                params = (
+                    mold_id,
+                    current_user_id,
+                    expected_return,
+                    status_id,
+                    destination_equipment,
+                    combined_remarks
+                )
+                
+                result = execute_query(insert_query, params)
+                
+                if result:
+                    st.success(f"✅ 借用申请已提交，申请编号：{result[0]['loan_id']}")
+                    st.balloons()
+                    # 清空表单
+                    st.rerun()
+                else:
+                    st.error("提交申请失败，请重试")
+
+def show_loan_approvals():
+    """显示待审批的借用申请"""
+    st.subheader("📋 待审批申请")
+    
+    # 获取待审批的申请
+    query = """
+    SELECT 
+        mlr.loan_id,
+        m.mold_code,
+        m.mold_name,
+        u.full_name as applicant_name,
+        mlr.application_timestamp,
+        mlr.expected_return_timestamp,
+        mlr.destination_equipment,
+        mlr.remarks,
+        sl.location_name as current_location
+    FROM mold_loan_records mlr
+    JOIN molds m ON mlr.mold_id = m.mold_id
+    JOIN users u ON mlr.applicant_id = u.user_id
+    JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
+    LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+    WHERE ls.status_name = '待审批'
+    ORDER BY mlr.application_timestamp ASC
+    """
+    
+    pending_loans = execute_query(query)
+    
+    if not pending_loans:
+        st.info("当前没有待审批的申请")
+        return
+    
+    # 显示待审批列表
+    for loan in pending_loans:
+        with st.expander(f"申请 #{loan['loan_id']} - {loan['mold_code']} - {loan['mold_name']}", expanded=True):
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.write(f"**申请人：** {loan['applicant_name']}")
+                st.write(f"**申请时间：** {loan['application_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                st.write(f"**使用设备：** {loan['destination_equipment']}")
+            
+            with col2:
+                st.write(f"**预计归还：** {loan['expected_return_timestamp'].strftime('%Y-%m-%d')}")
+                st.write(f"**模具位置：** {loan['current_location']}")
+                
+                # 计算借用天数
+                days = (loan['expected_return_timestamp'] - loan['application_timestamp']).days
+                st.write(f"**借用天数：** {days} 天")
+            
+            with col3:
+                st.write("**申请说明：**")
+                st.text(loan['remarks'] or "无")
+            
+            # 审批操作
+            col1, col2, col3 = st.columns([1, 1, 3])
+            
+            with col1:
+                if st.button("✅ 批准", key=f"approve_{loan['loan_id']}", type="primary"):
+                    approve_loan(loan['loan_id'])
+                    st.rerun()
+            
+            with col2:
+                if st.button("❌ 驳回", key=f"reject_{loan['loan_id']}"):
+                    reject_loan(loan['loan_id'])
+                    st.rerun()
+
+def approve_loan(loan_id):
+    """批准借用申请"""
+    try:
+        # 获取当前审批人ID
+        approver_id = st.session_state.get('user_id')
+        
+        # 更新借用记录状态为已批准
+        update_query = """
+        UPDATE mold_loan_records
+        SET loan_status_id = (SELECT status_id FROM loan_statuses WHERE status_name = '已批准'),
+            approver_id = %s,
+            approval_timestamp = NOW()
+        WHERE loan_id = %s
+        """
+        
+        result = execute_query(update_query, (approver_id, loan_id), fetch=False)
+        
+        if result:
+            st.success("✅ 申请已批准")
+        else:
+            st.error("批准操作失败")
+            
+    except Exception as e:
+        st.error(f"批准操作失败: {e}")
+
+def reject_loan(loan_id):
+    """驳回借用申请"""
+    try:
+        # 获取当前审批人ID
+        approver_id = st.session_state.get('user_id')
+        
+        # 弹出驳回原因输入框
+        reason = st.text_input(f"驳回原因 (申请#{loan_id})", key=f"reject_reason_{loan_id}")
+        
+        if st.button(f"确认驳回", key=f"confirm_reject_{loan_id}"):
+            if not reason:
+                st.error("请输入驳回原因")
+                return
+            
+            # 更新借用记录状态为已驳回
+            update_query = """
+            UPDATE mold_loan_records
+            SET loan_status_id = (SELECT status_id FROM loan_statuses WHERE status_name = '已驳回'),
+                approver_id = %s,
+                approval_timestamp = NOW(),
+                remarks = CONCAT(remarks, '\n驳回原因: ', %s)
+            WHERE loan_id = %s
+            """
+            
+            result = execute_query(update_query, (approver_id, reason, loan_id), fetch=False)
+            
+            if result:
+                st.success("✅ 申请已驳回")
+                st.rerun()
+            else:
+                st.error("驳回操作失败")
+                
+    except Exception as e:
+        st.error(f"驳回操作失败: {e}")
+
+def show_approved_loans():
+    """显示已批准待领用的申请"""
+    st.subheader("📦 待领用模具")
+    
+    query = """
+    SELECT 
+        mlr.loan_id,
+        mlr.mold_id,
+        m.mold_code,
+        m.mold_name,
+        u.full_name as applicant_name,
+        mlr.approval_timestamp,
+        mlr.expected_return_timestamp,
+        mlr.destination_equipment,
+        sl.location_name as current_location
+    FROM mold_loan_records mlr
+    JOIN molds m ON mlr.mold_id = m.mold_id
+    JOIN users u ON mlr.applicant_id = u.user_id
+    JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
+    LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+    WHERE ls.status_name = '已批准'
+    ORDER BY mlr.approval_timestamp ASC
+    """
+    
+    approved_loans = execute_query(query)
+    
+    if not approved_loans:
+        st.info("当前没有待领用的模具")
+        return
+    
+    # 显示待领用列表
+    for loan in approved_loans:
+        with st.expander(f"领用单 #{loan['loan_id']} - {loan['mold_code']} - {loan['mold_name']}"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write(f"**申请人：** {loan['applicant_name']}")
+                st.write(f"**批准时间：** {loan['approval_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                st.write(f"**使用设备：** {loan['destination_equipment']}")
+            
+            with col2:
+                st.write(f"**预计归还：** {loan['expected_return_timestamp'].strftime('%Y-%m-%d')}")
+                st.write(f"**模具位置：** {loan['current_location']}")
+            
+            # 发放操作
+            if st.button(f"✅ 确认发放", key=f"issue_{loan['loan_id']}", type="primary"):
+                issue_mold(loan['loan_id'], loan['mold_id'])
+                st.rerun()
+
+def issue_mold(loan_id, mold_id):
+    """发放模具"""
+    try:
+        # 开始事务
+        # 1. 更新借用记录状态为已领用
+        update_loan_query = """
+        UPDATE mold_loan_records
+        SET loan_status_id = (SELECT status_id FROM loan_statuses WHERE status_name = '已领用'),
+            loan_out_timestamp = NOW()
+        WHERE loan_id = %s
+        """
+        
+        # 2. 更新模具状态为已借出
+        update_mold_query = """
+        UPDATE molds
+        SET current_status_id = (SELECT status_id FROM mold_statuses WHERE status_name = '已借出'),
+            updated_at = NOW()
+        WHERE mold_id = %s
+        """
+        
+        # 执行更新
+        loan_result = execute_query(update_loan_query, (loan_id,), fetch=False)
+        mold_result = execute_query(update_mold_query, (convert_numpy_types(mold_id),), fetch=False)
+        
+        if loan_result and mold_result:
+            st.success("✅ 模具已发放")
+        else:
+            st.error("发放操作失败")
+            
+    except Exception as e:
+        st.error(f"发放操作失败: {e}")
+
+def show_borrowed_molds():
+    """显示已借出的模具"""
+    st.subheader("📤 已借出模具")
+    
+    query = """
+    SELECT 
+        mlr.loan_id,
+        mlr.mold_id,
+        m.mold_code,
+        m.mold_name,
+        u.full_name as borrower_name,
+        mlr.loan_out_timestamp,
+        mlr.expected_return_timestamp,
+        mlr.destination_equipment,
+        CASE 
+            WHEN mlr.expected_return_timestamp < NOW() THEN '逾期'
+            ELSE '正常'
+        END as status
+    FROM mold_loan_records mlr
+    JOIN molds m ON mlr.mold_id = m.mold_id
+    JOIN users u ON mlr.applicant_id = u.user_id
+    JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
+    WHERE ls.status_name = '已领用'
+    ORDER BY mlr.expected_return_timestamp ASC
+    """
+    
+    borrowed_molds = execute_query(query)
+    
+    if not borrowed_molds:
+        st.info("当前没有借出的模具")
+        return
+    
+    # 统计信息
+    total_borrowed = len(borrowed_molds)
+    overdue_count = len([m for m in borrowed_molds if m['status'] == '逾期'])
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("借出总数", total_borrowed)
+    with col2:
+        st.metric("逾期数量", overdue_count, delta=None if overdue_count == 0 else f"+{overdue_count}")
+    
+    # 显示借出列表
+    for mold in borrowed_molds:
+        # 根据状态设置不同的显示样式
+        if mold['status'] == '逾期':
+            with st.expander(f"⚠️ 【逾期】{mold['mold_code']} - {mold['mold_name']}", expanded=True):
+                display_borrowed_mold_info(mold)
+        else:
+            with st.expander(f"{mold['mold_code']} - {mold['mold_name']}"):
+                display_borrowed_mold_info(mold)
+
+def display_borrowed_mold_info(mold):
+    """显示借出模具的详细信息"""
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write(f"**借用人：** {mold['borrower_name']}")
+        st.write(f"**借出时间：** {mold['loan_out_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+        st.write(f"**使用设备：** {mold['destination_equipment']}")
+    
+    with col2:
+        st.write(f"**预计归还：** {mold['expected_return_timestamp'].strftime('%Y-%m-%d')}")
+        
+        # 计算已借用天数
+        days_borrowed = (datetime.now() - mold['loan_out_timestamp']).days
+        st.write(f"**已借用：** {days_borrowed} 天")
+        
+        if mold['status'] == '逾期':
+            days_overdue = (datetime.now() - mold['expected_return_timestamp']).days
+            st.write(f"**逾期天数：** :red[{days_overdue} 天]")
+    
+    # 归还操作
+    if st.button(f"📥 办理归还", key=f"return_{mold['loan_id']}"):
+        with st.form(f"return_form_{mold['loan_id']}"):
+            st.write("### 归还信息")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                return_status = st.selectbox(
+                    "模具状态",
+                    options=["正常", "需要保养", "需要维修", "有轻微磨损"],
+                    help="请检查模具状态"
+                )
+            
+            with col2:
+                strokes_used = st.number_input(
+                    "本次使用冲次",
+                    min_value=0,
+                    value=0,
+                    step=100,
+                    help="请填写本次实际使用的冲次数"
+                )
+            
+            return_remarks = st.text_area(
+                "归还备注",
+                placeholder="请填写模具使用情况、发现的问题等"
+            )
+            
+            submitted = st.form_submit_button("确认归还", type="primary")
+            
+            if submitted:
+                process_mold_return(
+                    mold['loan_id'], 
+                    mold['mold_id'], 
+                    return_status, 
+                    strokes_used,
+                    return_remarks
+                )
+                st.rerun()
+
+def process_mold_return(loan_id, mold_id, return_status, strokes_used, remarks):
+    """处理模具归还"""
+    try:
+        # 1. 更新借用记录
+        update_loan_query = """
+        UPDATE mold_loan_records
+        SET loan_status_id = (SELECT status_id FROM loan_statuses WHERE status_name = '已归还'),
+            actual_return_timestamp = NOW(),
+            remarks = CONCAT(COALESCE(remarks, ''), '\n归还信息: 状态-', %s, ', 使用冲次-', %s, '\n归还备注: ', %s)
+        WHERE loan_id = %s
+        """
+        
+        # 2. 根据归还状态确定模具新状态
+        mold_status_map = {
+            "正常": "闲置",
+            "需要保养": "待保养",
+            "需要维修": "待维修",
+            "有轻微磨损": "闲置"  # 轻微磨损也设为闲置，但会在备注中记录
+        }
+        new_mold_status = mold_status_map.get(return_status, "闲置")
+        
+        # 3. 更新模具状态和冲次
+        update_mold_query = """
+        UPDATE molds
+        SET current_status_id = (SELECT status_id FROM mold_statuses WHERE status_name = %s),
+            accumulated_strokes = accumulated_strokes + %s,
+            updated_at = NOW()
+        WHERE mold_id = %s
+        """
+        
+        # 4. 如果有使用冲次，插入使用记录
+        if strokes_used > 0:
+            # 获取借用人ID作为操作工ID
+            get_operator_query = """
+            SELECT applicant_id, destination_equipment 
+            FROM mold_loan_records 
+            WHERE loan_id = %s
+            """
+            operator_result = execute_query(get_operator_query, (loan_id,))
+            
+            if operator_result:
+                operator_id = operator_result[0]['applicant_id']
+                equipment_id = operator_result[0]['destination_equipment']
+                
+                insert_usage_query = """
+                INSERT INTO mold_usage_records (
+                    mold_id, operator_id, equipment_id,
+                    start_timestamp, end_timestamp,
+                    strokes_this_session, notes
+                ) VALUES (
+                    %s, %s, %s,
+                    (SELECT loan_out_timestamp FROM mold_loan_records WHERE loan_id = %s),
+                    NOW(),
+                    %s, %s
+                )
+                """
+                
+                usage_notes = f"借用归还记录 - {remarks}" if remarks else "借用归还记录"
+                
+                execute_query(
+                    insert_usage_query, 
+                    (
+                        convert_numpy_types(mold_id), 
+                        operator_id, 
+                        equipment_id,
+                        loan_id,
+                        strokes_used,
+                        usage_notes
+                    ),
+                    fetch=False
+                )
+        
+        # 执行更新
+        execute_query(
+            update_loan_query, 
+            (return_status, strokes_used, remarks or "", loan_id),
+            fetch=False
+        )
+        
+        execute_query(
+            update_mold_query,
+            (new_mold_status, strokes_used, convert_numpy_types(mold_id)),
+            fetch=False
+        )
+        
+        st.success("✅ 模具归还成功")
+        
+    except Exception as e:
+        st.error(f"归还操作失败: {e}")
+
+def show_loan_history():
+    """显示借用历史记录"""
+    st.subheader("📊 借用历史")
+    
+    # 筛选条件
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # 时间范围筛选
+        date_range = st.selectbox(
+            "时间范围",
+            options=["最近7天", "最近30天", "最近3个月", "全部"],
+            index=1
+        )
+    
+    with col2:
+        # 状态筛选
+        status_options = ["全部"] + [s['status_name'] for s in get_loan_statuses()]
+        selected_status = st.selectbox("状态筛选", status_options)
+    
+    with col3:
+        # 搜索框
+        search_term = st.text_input("搜索 (模具编号/借用人)", placeholder="输入关键词")
+    
+    # 构建查询条件
+    conditions = []
+    params = []
+    
+    # 时间条件
+    if date_range != "全部":
+        date_map = {
+            "最近7天": 7,
+            "最近30天": 30,
+            "最近3个月": 90
+        }
+        days = date_map.get(date_range, 30)
+        conditions.append("mlr.application_timestamp >= NOW() - INTERVAL '%s days'")
+        params.append(days)
+    
+    # 状态条件
+    if selected_status != "全部":
+        conditions.append("ls.status_name = %s")
+        params.append(selected_status)
+    
+    # 搜索条件
+    if search_term:
+        conditions.append("(m.mold_code ILIKE %s OR m.mold_name ILIKE %s OR u.full_name ILIKE %s)")
+        params.extend([f"%{search_term}%", f"%{search_term}%", f"%{search_term}%"])
+    
+    # 构建查询
+    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    
+    query = f"""
+    SELECT 
+        mlr.loan_id,
+        m.mold_code,
+        m.mold_name,
+        u.full_name as borrower_name,
+        mlr.application_timestamp,
+        mlr.loan_out_timestamp,
+        mlr.expected_return_timestamp,
+        mlr.actual_return_timestamp,
+        ls.status_name as loan_status,
+        mlr.destination_equipment,
+        CASE 
+            WHEN mlr.actual_return_timestamp IS NOT NULL THEN
+                mlr.actual_return_timestamp - mlr.loan_out_timestamp
+            WHEN ls.status_name = '已领用' THEN
+                NOW() - mlr.loan_out_timestamp
+            ELSE NULL
+        END as usage_duration
+    FROM mold_loan_records mlr
+    JOIN molds m ON mlr.mold_id = m.mold_id
+    JOIN users u ON mlr.applicant_id = u.user_id
+    JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
+    WHERE {where_clause}
+    ORDER BY mlr.application_timestamp DESC
+    LIMIT 100
+    """
+    
+    records = execute_query(query, params if params else None)
+    
+    if not records:
+        st.info("没有找到符合条件的记录")
+        return
+    
+    # 转换为DataFrame
+    df = pd.DataFrame(records)
+    
+    # 显示统计信息
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("总记录数", len(df))
+    with col2:
+        completed = len(df[df['loan_status'] == '已归还'])
+        st.metric("已归还", completed)
+    with col3:
+        in_use = len(df[df['loan_status'] == '已领用'])
+        st.metric("使用中", in_use)
+    with col4:
+        rejected = len(df[df['loan_status'] == '已驳回'])
+        st.metric("已驳回", rejected)
+    
+    # 显示数据表
+    st.dataframe(
+        df,
+        column_config={
+            "loan_id": st.column_config.NumberColumn("借用ID", width="small"),
+            "mold_code": st.column_config.TextColumn("模具编号", width="medium"),
+            "mold_name": st.column_config.TextColumn("模具名称", width="medium"),
+            "borrower_name": st.column_config.TextColumn("借用人", width="medium"),
+            "application_timestamp": st.column_config.DatetimeColumn("申请时间", width="medium"),
+            "loan_out_timestamp": st.column_config.DatetimeColumn("借出时间", width="medium"),
+            "actual_return_timestamp": st.column_config.DatetimeColumn("归还时间", width="medium"),
+            "loan_status": st.column_config.TextColumn("状态", width="small"),
+            "destination_equipment": st.column_config.TextColumn("使用设备", width="medium"),
+            "usage_duration": st.column_config.TextColumn("使用时长", width="medium")
+        },
+        use_container_width=True,
+        hide_index=True
+    )
+
+def show():
+    """主函数 - 显示借用管理页面"""
+    st.title("📤 借用管理")
+    
+    # 获取用户角色
+    user_role = st.session_state.get('user_role', '')
+    
+    # 根据角色显示不同的功能标签
+    if user_role == '冲压操作工':
+        # 操作工只能申请借用和查看自己的记录
+        tab1, tab2 = st.tabs(["📝 借用申请", "📊 我的借用记录"])
+        
+        with tab1:
+            create_loan_application()
+        
+        with tab2:
+            show_my_loan_records()
+    
+    elif user_role in ['模具库管理员', '超级管理员']:
+        # 管理员可以看到所有功能
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📝 新建申请", 
+            "📋 待审批", 
+            "📦 待领用", 
+            "📤 已借出", 
+            "📊 历史记录"
+        ])
+        
+        with tab1:
+            create_loan_application()
+        
+        with tab2:
+            show_loan_approvals()
+        
+        with tab3:
+            show_approved_loans()
+        
+        with tab4:
+            show_borrowed_molds()
+        
+        with tab5:
+            show_loan_history()
+    
+    else:
+        st.warning("您没有权限访问此功能")
+
+def show_my_loan_records():
+    """显示当前用户的借用记录"""
+    st.subheader("📊 我的借用记录")
+    
+    current_user_id = st.session_state.get('user_id')
+    
+    # 获取当前用户的借用记录
+    query = """
+    SELECT 
+        mlr.loan_id,
+        m.mold_code,
+        m.mold_name,
+        mlr.application_timestamp,
+        mlr.loan_out_timestamp,
+        mlr.expected_return_timestamp,
+        mlr.actual_return_timestamp,
+        ls.status_name as loan_status,
+        mlr.destination_equipment,
+        u2.full_name as approver_name,
+        mlr.remarks
+    FROM mold_loan_records mlr
+    JOIN molds m ON mlr.mold_id = m.mold_id
+    JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
+    LEFT JOIN users u2 ON mlr.approver_id = u2.user_id
+    WHERE mlr.applicant_id = %s
+    ORDER BY mlr.application_timestamp DESC
+    """
+    
+    my_records = execute_query(query, (current_user_id,))
+    
+    if not my_records:
+        st.info("您还没有借用记录")
+        return
+    
+    # 显示统计信息
+    total_records = len(my_records)
+    active_loans = len([r for r in my_records if r['loan_status'] == '已领用'])
+    pending_loans = len([r for r in my_records if r['loan_status'] == '待审批'])
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("总申请数", total_records)
+    with col2:
+        st.metric("使用中", active_loans)
+    with col3:
+        st.metric("待审批", pending_loans)
+    
+    # 显示记录列表
+    for record in my_records:
+        # 根据状态设置不同的标题颜色
+        status_emoji = {
+            "待审批": "🕐",
+            "已批准": "✅",
+            "已领用": "🔧",
+            "已归还": "📥",
+            "已驳回": "❌"
+        }
+        
+        emoji = status_emoji.get(record['loan_status'], "📋")
+        
+        with st.expander(f"{emoji} {record['mold_code']} - {record['mold_name']} ({record['loan_status']})"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write(f"**申请时间：** {record['application_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                if record['loan_out_timestamp']:
+                    st.write(f"**借出时间：** {record['loan_out_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                if record['actual_return_timestamp']:
+                    st.write(f"**归还时间：** {record['actual_return_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                st.write(f"**使用设备：** {record['destination_equipment']}")
+            
+            with col2:
+                st.write(f"**预计归还：** {record['expected_return_timestamp'].strftime('%Y-%m-%d')}")
+                st.write(f"**当前状态：** {record['loan_status']}")
+                if record['approver_name']:
+                    st.write(f"**审批人：** {record['approver_name']}")
+            
+            if record['remarks']:
+                st.write("**备注：**")
+                st.text(record['remarks'])
+            
+            # 如果是已领用状态，显示归还提醒
+            if record['loan_status'] == '已领用':
+                if record['expected_return_timestamp'].date() < datetime.now().date():
+                    st.warning("⚠️ 已超过预计归还时间，请尽快归还")

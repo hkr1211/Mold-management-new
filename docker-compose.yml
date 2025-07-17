@@ -1,0 +1,140 @@
+﻿services:
+  db:
+    image: postgres:15-alpine
+    container_name: mold_postgres
+    restart: always
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s # <--- 确保添加了这一行
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app  # 确保这行存在且缩进正确
+    volumes:            # <--- 新增这个 volumes 块
+      - .:/app          # <--- 将当前目录(.)映射到容器的/app目录
+    ports:
+      - "8501:8501"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+    depends_on:
+      db:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - app
+
+volumes:
+  postgres_data:
+
+
+
+
+
+# services:
+#   postgres:
+#     image: postgres:14
+#     container_name: mold_postgres
+#     environment:
+#       POSTGRES_DB: mold_management
+#       POSTGRES_USER: mold_user
+#       POSTGRES_PASSWORD: mold_password_123
+#       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+#     volumes:
+#       - postgres_data:/var/lib/postgresql/data
+#       - ./sql:/docker-entrypoint-initdb.d
+#     ports:
+#       - "5432:5432"
+#     networks:
+#       - mold_network
+#     restart: unless-stopped
+#     healthcheck:
+#       test: ["CMD-SHELL", "pg_isready -U mold_user -d mold_management"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 5
+#       start_period: 30s
+#  app:
+#    build: .
+#    container_name: mold_app
+#    environment:
+#      - DB_HOST=postgres
+#      - DB_NAME=mold_management
+#      - DB_USER=mold_user
+#      - DB_PASSWORD=mold_password_123
+#      - DB_PORT=5432
+#      - STREAMLIT_SERVER_PORT=8501
+#      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+#    volumes:
+#      - ./app:/app
+#      - ./uploads:/app/uploads
+#    ports:
+#      - "8501:8501"
+#    networks:
+#      - mold_network
+#    depends_on:
+#      postgres:
+#        condition: service_healthy
+#    restart: unless-stopped
+#    command: streamlit run main.py --server.address=0.0.0.0 --server.port=8501
+#services:
+#  app:
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
+#    working_dir: /app  # <--- 在这里添加这一行
+#    ports:
+#      - "8501:8501"
+#    environment:
+#      - POSTGRES_USER=${POSTGRES_USER}
+#      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+#      - POSTGRES_DB=${POSTGRES_DB}
+#      - POSTGRES_HOST=db
+#      - POSTGRES_PORT=5432
+#    depends_on:
+#      db:
+#        condition: service_healthy
+#
+#  nginx:
+#    image: nginx:alpine
+#    container_name: mold_nginx
+#    volumes:
+#      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+#    ports:
+#      - "80:80"
+#    networks:
+#      - mold_network
+#    depends_on:
+#      - app
+#    restart: unless-stopped
+#
+#volumes:
+#  postgres_data:
+#    driver: local
+#
+#networks:
+#  mold_network:
+#    driver: bridge

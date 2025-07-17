@@ -1,0 +1,538 @@
+﻿# pages/mold_management.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+from utils.database import (
+    get_all_molds, get_mold_by_id, search_molds,
+    get_mold_statuses, get_storage_locations, get_mold_functional_types,
+    execute_query
+)
+
+def convert_numpy_types(value):
+    """转换numpy类型为Python原生类型"""
+    if value is None:
+        return None
+    if isinstance(value, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(value)
+    elif isinstance(value, (np.floating, np.float64, np.float32)):
+        return float(value)
+    elif isinstance(value, np.bool_):
+        return bool(value)
+    elif isinstance(value, np.ndarray):
+        return value.tolist()
+    elif isinstance(value, str):
+        return value
+    return value
+
+def safe_get_mold_id_from_selection(selected_option, molds):
+    """安全地从选择项中获取模具ID"""
+    try:
+        if not selected_option or not molds:
+            return None
+        
+        # 从选择的字符串中提取模具编号
+        selected_mold_code = selected_option.split(" - ")[0]
+        
+        # 查找对应的模具
+        for mold in molds:
+            if str(mold.get('mold_code', '')) == selected_mold_code:
+                # 确保返回的是Python int类型
+                mold_id = mold.get('mold_id')
+                return convert_numpy_types(mold_id)
+        
+        return None
+    except Exception as e:
+        st.error(f"获取模具ID时出错: {e}")
+        return None
+
+def show_mold_list():
+    """显示模具列表"""
+    st.subheader("📋 模具列表")
+    
+    # 搜索区域
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        search_term = st.text_input("🔍 搜索模具 (编号或名称)", placeholder="输入模具编号或名称")
+    with col2:
+        if st.button("搜索", type="primary", use_container_width=True):
+            st.session_state.search_triggered = True
+    
+    # 筛选条件
+    col1, col2, col3 = st.columns(3)
+    
+    # 获取筛选选项数据
+    try:
+        statuses = get_mold_statuses() or []
+        locations = get_storage_locations() or []
+        types = get_mold_functional_types() or []
+    except Exception as e:
+        st.error(f"获取筛选选项失败: {e}")
+        statuses, locations, types = [], [], []
+    
+    with col1:
+        status_options = ["全部"] + [s['status_name'] for s in statuses]
+        selected_status = st.selectbox("状态筛选", status_options)
+    
+    with col2:
+        location_options = ["全部"] + [l['location_name'] for l in locations]
+        selected_location = st.selectbox("位置筛选", location_options)
+    
+    with col3:
+        type_options = ["全部"] + [t['type_name'] for t in types]
+        selected_type = st.selectbox("类型筛选", type_options)
+    
+    # 获取模具数据
+    try:
+        if search_term or st.session_state.get('search_triggered', False):
+            # 构建搜索参数 - 确保所有ID都是Python int类型
+            status_id = None
+            if selected_status != "全部":
+                for s in statuses:
+                    if s['status_name'] == selected_status:
+                        status_id = convert_numpy_types(s['status_id'])
+                        break
+            
+            location_id = None
+            if selected_location != "全部":
+                for l in locations:
+                    if l['location_name'] == selected_location:
+                        location_id = convert_numpy_types(l['location_id'])
+                        break
+            
+            type_id = None
+            if selected_type != "全部":
+                for t in types:
+                    if t['type_name'] == selected_type:
+                        type_id = convert_numpy_types(t['type_id'])
+                        break
+            
+            molds = search_molds(search_term, status_id, location_id, type_id)
+        else:
+            molds = get_all_molds()
+        
+        if not molds:
+            st.info("暂无模具数据")
+            return
+        
+        # 统计信息
+        total_molds = len(molds)
+        available_molds = len([m for m in molds if m.get('current_status') in ['闲置']])
+        in_use_molds = len([m for m in molds if m.get('current_status') in ['使用中', '已借出']])
+        maintenance_molds = len([m for m in molds if m.get('current_status') in ['维修中', '保养中', '待维修', '待保养']])
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("总数量", total_molds)
+        with col2:
+            st.metric("可用模具", available_molds)
+        with col3:
+            st.metric("使用中", in_use_molds)
+        with col4:
+            st.metric("维护中", maintenance_molds)
+        
+        # 将数据转换为DataFrame
+        df = pd.DataFrame(molds)
+        
+        # 显示数据表
+        st.dataframe(
+            df,
+            column_config={
+                "mold_id": st.column_config.NumberColumn("ID", width="small"),
+                "mold_code": st.column_config.TextColumn("模具编号", width="medium"),
+                "mold_name": st.column_config.TextColumn("模具名称", width="large"),
+                "mold_drawing_number": st.column_config.TextColumn("图号", width="medium"),
+                "functional_type": st.column_config.TextColumn("功能类型", width="medium"),
+                "supplier": st.column_config.TextColumn("制作人", width="medium"),
+                "theoretical_lifespan_strokes": st.column_config.NumberColumn("理论寿命", width="medium"),
+                "accumulated_strokes": st.column_config.NumberColumn("已用冲次", width="medium"),
+                "current_status": st.column_config.TextColumn("当前状态", width="medium"),
+                "current_location": st.column_config.TextColumn("存放位置", width="medium"),
+                "created_at": st.column_config.DatetimeColumn("创建时间", width="medium")
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        # 选择模具查看详情
+        st.markdown("---")
+        st.subheader("选择模具查看详情")
+        
+        # 创建选择选项
+        mold_options = [f"{m['mold_code']} - {m['mold_name']}" for m in molds]
+        
+        if mold_options:
+            # 使用session_state来跟踪选择的索引
+            if 'selected_mold_index' not in st.session_state:
+                st.session_state.selected_mold_index = 0
+            
+            selected_index = st.selectbox(
+                "选择模具:",
+                options=range(len(mold_options)),
+                format_func=lambda x: mold_options[x],
+                index=st.session_state.selected_mold_index,
+                key="mold_selector"
+            )
+            
+            if selected_index is not None:
+                # 更新session state
+                st.session_state.selected_mold_index = selected_index
+                
+                # 获取选中的模具
+                selected_mold = molds[selected_index]
+                
+                if selected_mold:
+                    # 安全地获取模具ID
+                    mold_id = convert_numpy_types(selected_mold.get('mold_id'))
+                    if mold_id:
+                        show_mold_detail(mold_id)
+                    else:
+                        st.error("无法获取模具ID")
+                    
+    except Exception as e:
+        st.error(f"获取模具数据失败: {e}")
+        st.exception(e)  # 显示详细错误信息用于调试
+
+def show_mold_detail(mold_id):
+    """显示模具详细信息"""
+    try:
+        # 确保mold_id是整数类型
+        mold_id = convert_numpy_types(mold_id)
+        
+        if mold_id is None:
+            st.error("模具ID无效")
+            return
+        
+        # 获取模具详细信息
+        mold = get_mold_by_id(mold_id)
+        
+        if not mold:
+            st.error(f"未找到模具信息 (ID: {mold_id})")
+            return
+        
+        st.markdown("---")
+        st.subheader(f"🔧 模具详情: {mold.get('mold_code', 'N/A')} - {mold.get('mold_name', 'N/A')}")
+        
+        # 基本信息
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**基本信息**")
+            st.write(f"**模具编号:** {mold.get('mold_code', 'N/A')}")
+            st.write(f"**模具名称:** {mold.get('mold_name', 'N/A')}")
+            st.write(f"**图号:** {mold.get('mold_drawing_number', 'N/A')}")
+            st.write(f"**功能类型:** {mold.get('functional_type', 'N/A')}")
+            st.write(f"**制作人:** {mold.get('supplier', 'N/A')}")
+            
+        with col2:
+            st.markdown("**状态信息**")
+            st.write(f"**当前状态:** {mold.get('current_status', 'N/A')}")
+            st.write(f"**存放位置:** {mold.get('current_location', 'N/A')}")
+            st.write(f"**制造日期:** {mold.get('manufacturing_date', 'N/A')}")
+            st.write(f"**验收日期:** {mold.get('acceptance_date', 'N/A')}")
+            st.write(f"**入账日期:** {mold.get('entry_date', 'N/A')}")
+        
+        # 使用情况
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**使用情况**")
+            theoretical_lifespan = convert_numpy_types(mold.get('theoretical_lifespan_strokes', 0)) or 0
+            accumulated_strokes = convert_numpy_types(mold.get('accumulated_strokes', 0)) or 0
+            
+            st.write(f"**理论寿命:** {theoretical_lifespan:,} 冲次")
+            st.write(f"**已用冲次:** {accumulated_strokes:,} 冲次")
+            
+            if theoretical_lifespan > 0:
+                usage_percentage = (accumulated_strokes / theoretical_lifespan) * 100
+                st.write(f"**使用率:** {usage_percentage:.1f}%")
+                
+                # 使用率进度条
+                st.progress(min(usage_percentage / 100, 1.0))
+                
+                remaining_strokes = max(0, theoretical_lifespan - accumulated_strokes)
+                st.write(f"**剩余寿命:** {remaining_strokes:,} 冲次")
+            
+        with col2:
+            st.markdown("**维护信息**")
+            maintenance_cycle = convert_numpy_types(mold.get('maintenance_cycle_strokes', 0)) or 0
+            st.write(f"**保养周期:** {maintenance_cycle:,} 冲次")
+            
+            if maintenance_cycle > 0 and accumulated_strokes > 0:
+                cycles_completed = accumulated_strokes // maintenance_cycle
+                next_maintenance = (cycles_completed + 1) * maintenance_cycle
+                strokes_to_maintenance = next_maintenance - accumulated_strokes
+                
+                st.write(f"**已完成保养周期:** {cycles_completed} 次")
+                st.write(f"**距下次保养:** {strokes_to_maintenance:,} 冲次")
+        
+        # 其他信息
+        if mold.get('remarks'):
+            st.markdown("**备注**")
+            st.info(mold.get('remarks'))
+        
+        # 获取相关记录
+        show_related_records(mold_id)
+        
+    except Exception as e:
+        st.error(f"获取模具详情失败: {e}")
+        st.exception(e)  # 显示详细错误信息用于调试
+
+def show_related_records(mold_id):
+    """显示相关记录"""
+    try:
+        # 确保mold_id是整数类型
+        mold_id = convert_numpy_types(mold_id)
+        
+        if mold_id is None:
+            st.error("模具ID无效")
+            return
+        
+        st.markdown("---")
+        st.subheader("📊 相关记录")
+        
+        # 使用tabs显示不同类型的记录
+        tab1, tab2, tab3, tab4 = st.tabs(["模具部件", "借用记录", "使用记录", "维修记录"])
+        
+        with tab1:
+            show_mold_parts(mold_id)
+        
+        with tab2:
+            show_loan_records(mold_id)
+        
+        with tab3:
+            show_usage_records(mold_id)
+        
+        with tab4:
+            show_maintenance_records(mold_id)
+            
+    except Exception as e:
+        st.error(f"获取相关记录失败: {e}")
+
+def show_mold_parts(mold_id):
+    """显示模具部件"""
+    try:
+        # 确保mold_id是整数类型
+        mold_id = convert_numpy_types(mold_id)
+        
+        query = """
+        SELECT 
+            mp.part_id,
+            mp.part_code,
+            mp.part_name,
+            mpc.category_name,
+            mp.material,
+            mp.supplier,
+            mp.installation_date,
+            mp.lifespan_strokes,
+            ms.status_name as current_status,
+            mp.remarks
+        FROM mold_parts mp
+        LEFT JOIN mold_part_categories mpc ON mp.part_category_id = mpc.category_id
+        LEFT JOIN mold_statuses ms ON mp.current_status_id = ms.status_id
+        WHERE mp.mold_id = %s
+        ORDER BY mpc.category_name, mp.part_name
+        """
+        
+        parts = execute_query(query, (mold_id,))
+        
+        if parts:
+            df = pd.DataFrame(parts)
+            st.dataframe(
+                df,
+                column_config={
+                    "part_id": st.column_config.NumberColumn("ID", width="small"),
+                    "part_code": st.column_config.TextColumn("部件编号", width="medium"),
+                    "part_name": st.column_config.TextColumn("部件名称", width="medium"),
+                    "category_name": st.column_config.TextColumn("部件分类", width="medium"),
+                    "material": st.column_config.TextColumn("材质", width="medium"),
+                    "supplier": st.column_config.TextColumn("制作人", width="medium"),
+                    "installation_date": st.column_config.DateColumn("安装日期", width="medium"),
+                    "lifespan_strokes": st.column_config.NumberColumn("设计寿命", width="medium"),
+                    "current_status": st.column_config.TextColumn("状态", width="medium"),
+                    "remarks": st.column_config.TextColumn("备注", width="large")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("暂无部件记录")
+            
+    except Exception as e:
+        st.error(f"获取部件信息失败: {e}")
+
+def show_loan_records(mold_id):
+    """显示借用记录"""
+    try:
+        # 确保mold_id是整数类型
+        mold_id = convert_numpy_types(mold_id)
+        
+        query = """
+        SELECT 
+            mlr.loan_id,
+            u1.full_name as applicant_name,
+            mlr.application_timestamp,
+            u2.full_name as approver_name,
+            mlr.approval_timestamp,
+            mlr.loan_out_timestamp,
+            mlr.expected_return_timestamp,
+            mlr.actual_return_timestamp,
+            ls.status_name as loan_status,
+            mlr.destination_equipment,
+            mlr.remarks
+        FROM mold_loan_records mlr
+        LEFT JOIN users u1 ON mlr.applicant_id = u1.user_id
+        LEFT JOIN users u2 ON mlr.approver_id = u2.user_id
+        LEFT JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
+        WHERE mlr.mold_id = %s
+        ORDER BY mlr.application_timestamp DESC
+        LIMIT 10
+        """
+        
+        records = execute_query(query, (mold_id,))
+        
+        if records:
+            df = pd.DataFrame(records)
+            st.dataframe(
+                df,
+                column_config={
+                    "loan_id": st.column_config.NumberColumn("借用ID", width="small"),
+                    "applicant_name": st.column_config.TextColumn("申请人", width="medium"),
+                    "application_timestamp": st.column_config.DatetimeColumn("申请时间", width="medium"),
+                    "approver_name": st.column_config.TextColumn("审批人", width="medium"),
+                    "approval_timestamp": st.column_config.DatetimeColumn("审批时间", width="medium"),
+                    "loan_out_timestamp": st.column_config.DatetimeColumn("借出时间", width="medium"),
+                    "actual_return_timestamp": st.column_config.DatetimeColumn("归还时间", width="medium"),
+                    "loan_status": st.column_config.TextColumn("状态", width="medium"),
+                    "destination_equipment": st.column_config.TextColumn("使用设备", width="medium"),
+                    "remarks": st.column_config.TextColumn("备注", width="large")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("暂无借用记录")
+            
+    except Exception as e:
+        st.error(f"获取借用记录失败: {e}")
+
+def show_usage_records(mold_id):
+    """显示使用记录"""
+    try:
+        # 确保mold_id是整数类型
+        mold_id = convert_numpy_types(mold_id)
+        
+        query = """
+        SELECT 
+            mur.usage_id,
+            u.full_name as operator_name,
+            mur.equipment_id,
+            mur.production_order_number,
+            p.product_name,
+            mur.start_timestamp,
+            mur.end_timestamp,
+            mur.strokes_this_session,
+            mur.produced_quantity,
+            mur.qualified_quantity,
+            mur.notes
+        FROM mold_usage_records mur
+        LEFT JOIN users u ON mur.operator_id = u.user_id
+        LEFT JOIN products p ON mur.product_id_produced = p.product_id
+        WHERE mur.mold_id = %s
+        ORDER BY mur.start_timestamp DESC
+        LIMIT 10
+        """
+        
+        records = execute_query(query, (mold_id,))
+        
+        if records:
+            df = pd.DataFrame(records)
+            st.dataframe(
+                df,
+                column_config={
+                    "usage_id": st.column_config.NumberColumn("使用ID", width="small"),
+                    "operator_name": st.column_config.TextColumn("操作工", width="medium"),
+                    "equipment_id": st.column_config.TextColumn("设备编号", width="medium"),
+                    "production_order_number": st.column_config.TextColumn("生产订单", width="medium"),
+                    "product_name": st.column_config.TextColumn("生产产品", width="medium"),
+                    "start_timestamp": st.column_config.DatetimeColumn("开始时间", width="medium"),
+                    "end_timestamp": st.column_config.DatetimeColumn("结束时间", width="medium"),
+                    "strokes_this_session": st.column_config.NumberColumn("本次冲次", width="medium"),
+                    "produced_quantity": st.column_config.NumberColumn("生产数量", width="medium"),
+                    "qualified_quantity": st.column_config.NumberColumn("合格数量", width="medium"),
+                    "notes": st.column_config.TextColumn("备注", width="large")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("暂无使用记录")
+            
+    except Exception as e:
+        st.error(f"获取使用记录失败: {e}")
+
+def show_maintenance_records(mold_id):
+    """显示维修记录"""
+    try:
+        # 确保mold_id是整数类型
+        mold_id = convert_numpy_types(mold_id)
+        
+        query = """
+        SELECT 
+            mml.log_id,
+            mt.type_name as maintenance_type,
+            mml.problem_description,
+            mml.actions_taken,
+            mml.maintenance_start_timestamp,
+            mml.maintenance_end_timestamp,
+            u.full_name as maintained_by,
+            mml.maintenance_cost,
+            mrs.status_name as result_status,
+            mml.notes
+        FROM mold_maintenance_logs mml
+        LEFT JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
+        LEFT JOIN users u ON mml.maintained_by_id = u.user_id
+        LEFT JOIN maintenance_result_statuses mrs ON mml.result_status_id = mrs.status_id
+        WHERE mml.mold_id = %s
+        ORDER BY mml.maintenance_start_timestamp DESC
+        LIMIT 10
+        """
+        
+        records = execute_query(query, (mold_id,))
+        
+        if records:
+            df = pd.DataFrame(records)
+            st.dataframe(
+                df,
+                column_config={
+                    "log_id": st.column_config.NumberColumn("记录ID", width="small"),
+                    "maintenance_type": st.column_config.TextColumn("维修类型", width="medium"),
+                    "problem_description": st.column_config.TextColumn("问题描述", width="large"),
+                    "actions_taken": st.column_config.TextColumn("处理措施", width="large"),
+                    "maintenance_start_timestamp": st.column_config.DatetimeColumn("开始时间", width="medium"),
+                    "maintenance_end_timestamp": st.column_config.DatetimeColumn("结束时间", width="medium"),
+                    "maintained_by": st.column_config.TextColumn("维修人员", width="medium"),
+                    "maintenance_cost": st.column_config.NumberColumn("维修成本", width="medium"),
+                    "result_status": st.column_config.TextColumn("结果状态", width="medium"),
+                    "notes": st.column_config.TextColumn("备注", width="large")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("暂无维修记录")
+            
+    except Exception as e:
+        st.error(f"获取维修记录失败: {e}")
+
+def show():
+    """主函数 - 显示模具管理页面"""
+    st.title("📋 模具管理")
+    
+    # 权限检查
+    user_role = st.session_state.get('user_role', '')
+    if user_role not in ['超级管理员', '模具库管理员']:
+        st.warning("您没有权限访问此功能")
+        return
+    
+    # 显示模具列表
+    show_mold_list()

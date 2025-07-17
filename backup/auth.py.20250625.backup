@@ -1,0 +1,108 @@
+# app/utils/auth.py (最终修正版)
+
+import streamlit as st
+import bcrypt
+import logging
+import json
+from .database import execute_query
+
+logging.basicConfig(level=logging.INFO)
+
+# 简化的角色权限映射
+ROLE_PERMISSIONS = {
+    'admin': ['*'],  # 所有权限
+    'manager': [
+        'view_molds', 'manage_molds', 'approve_loans', 'view_reports'
+    ],
+    'operator': [
+        'view_molds', 'create_loan', 'view_own_loans'
+    ]
+}
+
+def has_permission(permission: str) -> bool:
+    """检查当前用户是否有指定权限"""
+    if not st.session_state.get('logged_in'):
+        return False
+    
+    user_role = st.session_state.get('user_role', '')
+    permissions = ROLE_PERMISSIONS.get(user_role, [])
+    
+    # 超级管理员拥有所有权限
+    if '*' in permissions:
+        return True
+    
+    return permission in permissions
+
+def login_user(username: str, password: str) -> dict | None:
+    """验证用户登录，成功则返回用户信息字典"""
+    if not username or not password:
+        return None
+
+    # 已修正：不再JOIN roles表
+    query = "SELECT id, username, password_hash, role, is_active FROM users WHERE username = %s"
+    
+    try:
+        user = execute_query(query, params=(username,), fetch_one=True)
+        
+        if user and user['is_active'] and bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
+            user_info = {
+                'user_id': user['id'],
+                'username': user['username'],
+                'user_role': user['role'] # 统一使用 user_role
+            }
+            # 设置会话状态
+            st.session_state['logged_in'] = True
+            for key, value in user_info.items():
+                st.session_state[key] = value
+            
+            log_user_action('LOGIN', 'system', username)
+            return user_info
+    except Exception as e:
+        logging.error(f"登录错误: {e}")
+    
+    return None
+
+def logout_user():
+    """用户登出"""
+    username = st.session_state.get('username', '')
+    if username:
+        log_user_action('LOGOUT', 'system', username)
+    
+    # 清除会话状态
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+
+def get_all_users():
+    """获取所有用户列表（已添加权限检查）"""
+    if not has_permission('manage_users'):
+        st.warning("无权获取用户列表。")
+        return []
+
+    # 已修正：不再JOIN roles表
+    query = "SELECT id, username, role, is_active, created_at FROM users ORDER BY created_at DESC"
+    try:
+        return execute_query(query, fetch_all=True) or []
+    except Exception as e:
+        logging.error(f"获取用户列表失败: {e}")
+        return []
+
+def log_user_action(action_type: str, target_resource: str, target_id: str, details: dict = None):
+    """记录用户操作日志"""
+    user_id = st.session_state.get('user_id')
+    if not user_id:
+        return
+    
+    query = """
+    INSERT INTO system_logs (user_id, action_type, target_resource, target_id, details)
+    VALUES (%s, %s, %s, %s, %s)
+    """
+    try:
+        details_json = json.dumps(details) if details else None
+        execute_query(
+            query,
+            params=(user_id, action_type, target_resource, target_id, details_json),
+            commit=True
+        )
+    except Exception as e:
+        # 如果system_logs表不存在，暂时只打印日志，不中断应用
+        logging.error(f"记录操作日志失败 (可能是表不存在): {e}")

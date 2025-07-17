@@ -1,0 +1,50 @@
+﻿import streamlit as st
+import os
+import psycopg2
+
+def show_mold_management():
+    st.header("🔧 模具管理")
+    st.success("模具管理模块已成功加载！")
+    
+    st.write("数据库连接测试...")
+    
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv('DB_HOST', 'postgres'),
+            database=os.getenv('DB_NAME', 'mold_management'),
+            user=os.getenv('DB_USER', 'mold_user'),
+            password=os.getenv('DB_PASSWORD', 'mold_password_123'),
+            port=os.getenv('DB_PORT', '5432')
+        )
+        st.success("✅ 数据库连接成功！")
+        
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM molds")
+        count = cursor.fetchone()[0]
+        st.info(f"当前数据库中有 {count} 个模具")
+        
+        cursor.close()
+        conn.close()
+        
+    except Exception as e:
+        st.error(f"❌ 数据库连接失败: {e}")
+    
+    tab1, tab2 = st.tabs(["模具列表", "新增模具"])
+    
+    with tab1:
+        st.subheader("模具列表")
+        if st.button("加载模具数据"):
+            st.info("模具列表功能开发中...")
+            
+    with tab2:
+        st.subheader("新增模具")
+        with st.form("simple_form"):
+            mold_code = st.text_input("模具编号")
+            mold_name = st.text_input("模具名称")
+            submitted = st.form_submit_button("保存")
+            
+            if submitted:
+                if mold_code and mold_name:
+                    st.success(f"模具 {mold_code} - {mold_name} 信息已记录！")
+                else:
+                    st.error("请填写模具编号和名称")

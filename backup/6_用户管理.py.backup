@@ -1,0 +1,591 @@
+# pages/user_management.py
+"""
+用户管理模块
+功能：用户的增删改查、权限管理、操作日志查看
+权限：仅超级管理员可访问
+"""
+
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+from utils.auth import (
+    has_permission, get_all_users, create_user, update_user_status,
+    get_user_activity_log, get_all_roles, validate_password_strength,
+    update_user_password, log_user_action
+)
+from utils.database import execute_query
+import logging
+
+def show():
+    """用户管理主页面"""
+    st.title("👥 用户管理")
+    
+    # 权限检查
+    if not has_permission('manage_users'):
+        st.error("❌ 权限不足：仅超级管理员可以访问用户管理功能")
+        return
+    
+    # 添加自定义样式
+    st.markdown("""
+    <style>
+        .user-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin: 10px 0;
+            border-left: 4px solid #1f77b4;
+        }
+        .status-active { color: #4caf50; font-weight: bold; }
+        .status-inactive { color: #f44336; font-weight: bold; }
+        .role-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: bold;
+            margin: 2px;
+        }
+        .role-admin { background: #e3f2fd; color: #1976d2; }
+        .role-manager { background: #f3e5f5; color: #7b1fa2; }
+        .role-technician { background: #e8f5e9; color: #388e3c; }
+        .role-operator { background: #fff3e0; color: #f57c00; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # 页面导航
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "👥 用户列表", "➕ 新增用户", "🔐 角色权限", "📊 操作日志"
+    ])
+    
+    with tab1:
+        show_user_list()
+    
+    with tab2:
+        show_create_user()
+    
+    with tab3:
+        show_role_management()
+    
+    with tab4:
+        show_activity_logs()
+
+def show_user_list():
+    """显示用户列表"""
+    st.markdown("### 👥 系统用户列表")
+    
+    # 筛选条件
+    col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+    with col1:
+        search_term = st.text_input("🔍 搜索用户", placeholder="输入用户名或姓名", key="user_search")
+    with col2:
+        role_filter = st.selectbox(
+            "角色筛选",
+            ["全部"] + [r['role_name'] for r in get_all_roles()],
+            key="role_filter"
+        )
+    with col3:
+        status_filter = st.selectbox("状态筛选", ["全部", "启用", "禁用"], key="status_filter")
+    with col4:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 刷新", key="refresh_users"):
+            st.rerun()
+    
+    # 获取用户列表
+    users = get_all_users()
+    
+    # 应用筛选
+    if search_term:
+        users = [u for u in users if search_term.lower() in u['username'].lower() 
+                 or search_term.lower() in u['full_name'].lower()]
+    if role_filter != "全部":
+        users = [u for u in users if u['role_name'] == role_filter]
+    if status_filter != "全部":
+        is_active = status_filter == "启用"
+        users = [u for u in users if u['is_active'] == is_active]
+    
+    # 统计信息
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("总用户数", len(get_all_users()))
+    with col2:
+        active_users = len([u for u in get_all_users() if u['is_active']])
+        st.metric("活跃用户", active_users)
+    with col3:
+        st.metric("当前筛选", len(users))
+    with col4:
+        roles_count = len(get_all_roles())
+        st.metric("角色数", roles_count)
+    
+    st.markdown("---")
+    
+    # 显示用户列表
+    if users:
+        # 使用列布局显示用户卡片
+        for i in range(0, len(users), 2):
+            cols = st.columns(2)
+            for j in range(2):
+                if i + j < len(users):
+                    user = users[i + j]
+                    with cols[j]:
+                        display_user_card(user)
+    else:
+        st.info("😔 没有找到符合条件的用户")
+
+def display_user_card(user):
+    """显示用户卡片"""
+    status_class = "status-active" if user['is_active'] else "status-inactive"
+    status_text = "✅ 启用" if user['is_active'] else "❌ 禁用"
+    
+    # 角色样式映射
+    role_style_map = {
+        '超级管理员': 'role-admin',
+        '模具库管理员': 'role-manager',
+        '模具工': 'role-technician',
+        '冲压操作工': 'role-operator'
+    }
+    role_class = role_style_map.get(user['role_name'], '')
+    
+    # 用户卡片HTML
+    card_html = f"""
+    <div class="user-card">
+        <h4>{user['full_name']}</h4>
+        <p><strong>用户名:</strong> {user['username']}</p>
+        <p><strong>角色:</strong> <span class="role-badge {role_class}">{user['role_name']}</span></p>
+        <p><strong>状态:</strong> <span class="{status_class}">{status_text}</span></p>
+        <p><strong>邮箱:</strong> {user.get('email', '未设置')}</p>
+        <p><strong>创建时间:</strong> {user['created_at'].strftime('%Y-%m-%d')}</p>
+    </div>
+    """
+    st.markdown(card_html, unsafe_allow_html=True)
+    
+    # 操作按钮
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if user['is_active']:
+            if st.button(f"🔒 禁用", key=f"disable_{user['user_id']}"):
+                success, msg = update_user_status(user['user_id'], False)
+                if success:
+                    st.success(msg)
+                    log_user_action('DISABLE_USER', 'users', str(user['user_id']))
+                    st.rerun()
+                else:
+                    st.error(msg)
+        else:
+            if st.button(f"🔓 启用", key=f"enable_{user['user_id']}"):
+                success, msg = update_user_status(user['user_id'], True)
+                if success:
+                    st.success(msg)
+                    log_user_action('ENABLE_USER', 'users', str(user['user_id']))
+                    st.rerun()
+                else:
+                    st.error(msg)
+    
+    with col2:
+        if st.button(f"✏️ 编辑", key=f"edit_{user['user_id']}"):
+            st.session_state['edit_user_id'] = user['user_id']
+            st.info("编辑功能开发中...")
+    
+    with col3:
+        if st.button(f"📊 日志", key=f"logs_{user['user_id']}"):
+            st.session_state['view_user_logs'] = user['user_id']
+            st.rerun()
+
+def show_create_user():
+    """新增用户界面"""
+    st.markdown("### ➕ 新增系统用户")
+    
+    # 说明信息
+    st.info("""
+    💡 **提示**：
+    - 用户名用于登录，创建后不可修改
+    - 密码要求：至少8位，包含大小写字母和数字
+    - 邮箱用于密码重置和系统通知
+    """)
+    
+    with st.form("create_user_form", clear_on_submit=True):
+        st.markdown("#### 基本信息")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            username = st.text_input(
+                "用户名 *", 
+                placeholder="例如: zhangsan",
+                help="用于登录的唯一标识，只能包含字母、数字和下划线"
+            )
+            full_name = st.text_input(
+                "真实姓名 *",
+                placeholder="例如: 张三"
+            )
+            email = st.text_input(
+                "邮箱地址", 
+                placeholder="例如: zhangsan@company.com",
+                help="用于密码重置和通知"
+            )
+        
+        with col2:
+            password = st.text_input(
+                "初始密码 *", 
+                type="password",
+                help="至少8位，包含大小写字母和数字"
+            )
+            password_confirm = st.text_input(
+                "确认密码 *", 
+                type="password"
+            )
+            roles = get_all_roles()
+            role_id = st.selectbox(
+                "用户角色 *",
+                options=[(r['role_id'], r['role_name']) for r in roles],
+                format_func=lambda x: x[1],
+                help="选择用户的系统角色"
+            )[0]
+        
+        # 额外选项
+        st.markdown("#### 账户选项")
+        col1, col2 = st.columns(2)
+        with col1:
+            send_email = st.checkbox("发送欢迎邮件", value=True, help="向用户发送账户信息")
+        with col2:
+            force_change = st.checkbox("首次登录修改密码", value=True, help="要求用户首次登录时修改密码")
+        
+        # 提交按钮
+        col1, col2, col3 = st.columns([1, 1, 3])
+        with col1:
+            submitted = st.form_submit_button("✅ 创建用户", type="primary")
+        with col2:
+            if st.form_submit_button("❌ 取消"):
+                st.rerun()
+        
+        if submitted:
+            # 验证输入
+            errors = []
+            
+            # 基础验证
+            if not all([username, full_name, password, password_confirm]):
+                errors.append("请填写所有必填字段")
+            
+            # 用户名格式验证
+            if username and not username.replace('_', '').isalnum():
+                errors.append("用户名只能包含字母、数字和下划线")
+            
+            # 密码验证
+            if password != password_confirm:
+                errors.append("两次输入的密码不一致")
+            
+            if password:
+                is_valid, msg = validate_password_strength(password)
+                if not is_valid:
+                    errors.append(msg)
+            
+            # 邮箱格式验证
+            if email and '@' not in email:
+                errors.append("邮箱格式不正确")
+            
+            if errors:
+                for error in errors:
+                    st.error(f"❌ {error}")
+            else:
+                # 创建用户
+                with st.spinner("正在创建用户..."):
+                    success, msg = create_user(username, password, full_name, role_id, email)
+                    
+                if success:
+                    st.success(f"✅ {msg}")
+                    st.balloons()
+                    
+                    # 记录操作日志
+                    log_user_action('CREATE_USER', 'users', username, {
+                        'full_name': full_name,
+                        'role_id': role_id,
+                        'email': email
+                    })
+                    
+                    # 模拟发送邮件
+                    if send_email and email:
+                        st.info(f"📧 欢迎邮件已发送至 {email}")
+                    
+                    # 延迟后刷新页面
+                    import time
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error(f"❌ {msg}")
+
+def show_role_management():
+    """角色权限管理界面"""
+    st.markdown("### 🔐 角色权限管理")
+    
+    # 获取所有角色
+    roles = get_all_roles()
+    
+    # 角色统计
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("系统角色数", len(roles))
+    with col2:
+        admin_count = len([u for u in get_all_users() if u['role_name'] == '超级管理员'])
+        st.metric("超级管理员", admin_count)
+    with col3:
+        manager_count = len([u for u in get_all_users() if u['role_name'] == '模具库管理员'])
+        st.metric("模具库管理员", manager_count)
+    with col4:
+        operator_count = len([u for u in get_all_users() if u['role_name'] == '冲压操作工'])
+        st.metric("冲压操作工", operator_count)
+    
+    st.markdown("---")
+    
+    # 显示角色详情
+    for role in roles:
+        with st.expander(f"**{role['role_name']}** - {role['description']}", expanded=False):
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.markdown(f"**角色ID**: {role['role_id']}")
+                st.markdown(f"**描述**: {role['description']}")
+                
+                # 获取该角色的用户数
+                role_users = [u for u in get_all_users() if u['role_name'] == role['role_name']]
+                st.markdown(f"**用户数**: {len(role_users)} 人")
+                
+                # 显示权限列表（硬编码的权限映射）
+                st.markdown("**主要权限**:")
+                permissions = get_role_permissions_display(role['role_name'])
+                for perm in permissions:
+                    st.markdown(f"- {perm}")
+            
+            with col2:
+                # 显示该角色的用户列表
+                if role_users:
+                    st.markdown("**该角色用户**:")
+                    for user in role_users[:5]:  # 最多显示5个
+                        st.markdown(f"- {user['full_name']} ({user['username']})")
+                    if len(role_users) > 5:
+                        st.markdown(f"... 还有 {len(role_users) - 5} 个用户")
+    
+    # 权限说明
+    with st.expander("📖 权限详细说明", expanded=False):
+        st.markdown("""
+        #### 权限等级说明
+        
+        1. **超级管理员** - 最高权限
+           - 完全控制系统所有功能
+           - 用户和角色管理
+           - 系统配置和维护
+           - 数据备份和恢复
+        
+        2. **模具库管理员** - 业务管理权限
+           - 模具台账管理（增删改查）
+           - 借用申请审批
+           - 维修任务分配
+           - 业务报表查看
+        
+        3. **模具工** - 执行权限
+           - 维修任务执行
+           - 维修记录填写
+           - 部件更换记录
+           - 个人任务查看
+        
+        4. **冲压操作工** - 基础权限
+           - 模具信息查询
+           - 借用申请提交
+           - 使用记录填写
+           - 个人记录查看
+        """)
+
+def show_activity_logs():
+    """显示操作日志"""
+    st.markdown("### 📊 用户操作日志")
+    
+    # 查看特定用户的日志
+    if 'view_user_logs' in st.session_state:
+        user_id = st.session_state['view_user_logs']
+        user = next((u for u in get_all_users() if u['user_id'] == user_id), None)
+        if user:
+            st.info(f"正在查看用户 **{user['full_name']} ({user['username']})** 的操作日志")
+            if st.button("🔙 返回全部日志"):
+                del st.session_state['view_user_logs']
+                st.rerun()
+    
+    # 查询条件
+    col1, col2, col3, col4 = st.columns([2, 2, 1, 1])
+    
+    with col1:
+        if 'view_user_logs' not in st.session_state:
+            user_filter = st.selectbox(
+                "用户筛选",
+                ["全部"] + [(u['user_id'], f"{u['full_name']} ({u['username']})") 
+                           for u in get_all_users()],
+                format_func=lambda x: "全部" if x == "全部" else x[1],
+                key="log_user_filter"
+            )
+        else:
+            user_filter = st.session_state['view_user_logs']
+    
+    with col2:
+        action_types = ['全部', '登录', '创建', '修改', '删除', '审批']
+        action_filter = st.selectbox("操作类型", action_types, key="action_filter")
+    
+    with col3:
+        days = st.number_input("最近天数", min_value=1, max_value=90, value=7, key="log_days")
+    
+    with col4:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 刷新日志"):
+            st.rerun()
+    
+    # 获取日志
+    if 'view_user_logs' in st.session_state:
+        user_id = st.session_state['view_user_logs']
+    else:
+        user_id = None if user_filter == "全部" else user_filter[0]
+    
+    logs = get_user_activity_log(user_id, days)
+    
+    # 应用操作类型筛选
+    if action_filter != '全部' and logs:
+        action_map = {
+            '登录': ['LOGIN', 'LOGOUT'],
+            '创建': ['CREATE_USER', 'CREATE_MOLD', 'CREATE_LOAN', 'CREATE_MAINTENANCE'],
+            '修改': ['UPDATE_USER', 'UPDATE_MOLD', 'UPDATE_LOAN', 'UPDATE_MAINTENANCE'],
+            '删除': ['DELETE_USER', 'DELETE_MOLD', 'DELETE_LOAN', 'DELETE_MAINTENANCE'],
+            '审批': ['APPROVE_LOAN', 'REJECT_LOAN']
+        }
+        filter_actions = action_map.get(action_filter, [])
+        logs = [log for log in logs if any(action in log['action_type'] for action in filter_actions)]
+    
+    # 显示日志统计
+    if logs:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("日志条数", len(logs))
+        with col2:
+            unique_users = len(set(log['user_id'] for log in logs if log['user_id']))
+            st.metric("活跃用户", unique_users)
+        with col3:
+            login_count = len([log for log in logs if 'LOGIN' in log['action_type']])
+            st.metric("登录次数", login_count)
+        with col4:
+            # 计算今日操作数
+            today = datetime.now().date()
+            today_logs = [log for log in logs if log['timestamp'].date() == today]
+            st.metric("今日操作", len(today_logs))
+    
+    st.markdown("---")
+    
+    # 显示日志列表
+    if logs:
+        # 转换为DataFrame以便显示
+        df = pd.DataFrame(logs)
+        
+        # 格式化显示
+        df['时间'] = pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+        df['操作类型'] = df['action_type'].map(get_action_type_display)
+        df['用户'] = df.apply(lambda x: f"{x['full_name']} ({x['username']})" 
+                            if x['username'] else '系统', axis=1)
+        
+        # 选择显示的列
+        display_columns = ['时间', '用户', '操作类型', 'target_resource', 'target_id']
+        
+        # 使用表格显示
+        st.dataframe(
+            df[display_columns],
+            column_config={
+                '时间': st.column_config.TextColumn('操作时间', width=150),
+                '用户': st.column_config.TextColumn('操作用户', width=150),
+                '操作类型': st.column_config.TextColumn('操作类型', width=120),
+                'target_resource': st.column_config.TextColumn('目标资源', width=100),
+                'target_id': st.column_config.TextColumn('目标ID', width=80),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        # 导出功能
+        st.markdown("---")
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            csv = df[display_columns].to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                label="📥 导出日志",
+                data=csv,
+                file_name=f"操作日志_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+    else:
+        st.info("😊 没有找到符合条件的操作日志")
+
+def get_role_permissions_display(role_name):
+    """获取角色权限的显示文本"""
+    permissions_map = {
+        '超级管理员': [
+            '✅ 系统所有功能的完全访问权限',
+            '✅ 用户账户管理（创建、编辑、禁用）',
+            '✅ 角色权限配置',
+            '✅ 系统参数设置',
+            '✅ 数据备份和恢复',
+            '✅ 查看所有操作日志'
+        ],
+        '模具库管理员': [
+            '✅ 模具台账管理（新增、编辑、删除）',
+            '✅ 借用申请审批',
+            '✅ 维修任务分配',
+            '✅ 查看统计报表',
+            '✅ 管理存储位置和分类',
+            '❌ 用户管理权限'
+        ],
+        '模具工': [
+            '✅ 查看分配的维修任务',
+            '✅ 填写维修记录',
+            '✅ 更新任务状态',
+            '✅ 记录部件更换',
+            '❌ 模具信息编辑权限',
+            '❌ 借用审批权限'
+        ],
+        '冲压操作工': [
+            '✅ 查询模具信息',
+            '✅ 提交借用申请',
+            '✅ 查看个人借用记录',
+            '✅ 填写使用记录',
+            '❌ 模具信息编辑权限',
+            '❌ 查看他人记录'
+        ]
+    }
+    return permissions_map.get(role_name, ['暂无权限说明'])
+
+def get_action_type_display(action_type):
+    """获取操作类型的中文显示"""
+    action_map = {
+        'LOGIN': '用户登录',
+        'LOGOUT': '用户登出',
+        'CREATE_USER': '创建用户',
+        'UPDATE_USER': '更新用户',
+        'DELETE_USER': '删除用户',
+        'DISABLE_USER': '禁用用户',
+        'ENABLE_USER': '启用用户',
+        'CREATE_MOLD': '新增模具',
+        'UPDATE_MOLD': '更新模具',
+        'DELETE_MOLD': '删除模具',
+        'CREATE_LOAN': '创建借用',
+        'UPDATE_LOAN': '更新借用',
+        'APPROVE_LOAN': '批准借用',
+        'REJECT_LOAN': '驳回借用',
+        'CREATE_MAINTENANCE': '创建维修',
+        'UPDATE_MAINTENANCE': '更新维修',
+        'VIEW_REPORT': '查看报表',
+        'EXPORT_DATA': '导出数据',
+        'SYSTEM_CONFIG': '系统配置'
+    }
+    return action_map.get(action_type, action_type)
+
+# 独立运行测试
+if __name__ == "__main__":
+    # 模拟登录状态
+    if 'logged_in' not in st.session_state:
+        st.session_state['logged_in'] = True
+        st.session_state['user_id'] = 1
+        st.session_state['user_role'] = '超级管理员'
+        st.session_state['username'] = 'admin'
+    
+    show()

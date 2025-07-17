@@ -1,0 +1,342 @@
+# app/utils/auth.py (修复版)
+
+import streamlit as st
+import bcrypt
+import logging
+import json
+from .database import execute_query
+
+logging.basicConfig(level=logging.INFO)
+
+# 角色权限映射（与数据库中的角色名称匹配）
+ROLE_PERMISSIONS = {
+    '超级管理员': ['*'],  # 所有权限
+    'admin': ['*'],  # 兼容旧版本
+    '模具库管理员': [
+        'view_all_molds', 'create_mold', 'edit_mold',
+        'view_all_loans', 'approve_loan', 'reject_loan', 'manage_loan',
+        'view_all_maintenance', 'create_maintenance',
+        'view_statistics', 'manage_users'
+    ],
+    'manager': [  # 兼容旧版本
+        'view_all_molds', 'create_mold', 'edit_mold',
+        'view_all_loans', 'approve_loan', 'reject_loan', 'manage_loan',
+        'view_all_maintenance', 'create_maintenance',
+        'view_statistics'
+    ],
+    '模具工': [
+        'view_molds', 'view_maintenance', 'create_maintenance', 'edit_own_maintenance'
+    ],
+    '冲压操作工': [
+        'view_molds', 'create_loan', 'view_own_loans'
+    ],
+    'operator': [  # 兼容旧版本
+        'view_molds', 'create_loan', 'view_own_loans'
+    ]
+}
+
+def has_permission(permission: str) -> bool:
+    """检查当前用户是否有指定权限"""
+    if not st.session_state.get('logged_in'):
+        return False
+    
+    user_role = st.session_state.get('user_role', '')
+    permissions = ROLE_PERMISSIONS.get(user_role, [])
+    
+    # 超级管理员拥有所有权限
+    if '*' in permissions:
+        return True
+    
+    return permission in permissions
+
+def get_user_permissions() -> list:
+    """获取当前用户的所有权限"""
+    if not st.session_state.get('logged_in'):
+        return []
+    
+    user_role = st.session_state.get('user_role', '')
+    return ROLE_PERMISSIONS.get(user_role, [])
+
+def login_user(username: str, password: str) -> dict | None:
+    """验证用户登录，成功则返回用户信息字典"""
+    if not username or not password:
+        return None
+
+    # 修复：适配新的数据库结构
+    query = """
+    SELECT 
+        u.user_id, 
+        u.username, 
+        u.password_hash, 
+        u.full_name,
+        u.is_active,
+        COALESCE(r.role_name, u.role) as role_name
+    FROM users u
+    LEFT JOIN roles r ON u.role_id = r.role_id
+    WHERE u.username = %s
+    """
+    
+    try:
+        user = execute_query(query, params=(username,), fetch_one=True)
+        
+        if user and user['is_active']:
+            # 验证密码
+            if bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
+                user_info = {
+                    'user_id': user['user_id'],
+                    'username': user['username'],
+                    'full_name': user.get('full_name', user['username']),
+                    'user_role': user['role_name'],  # 使用统一的字段名
+                    'role': user['role_name']  # 兼容性
+                }
+                
+                # 设置会话状态
+                st.session_state['logged_in'] = True
+                for key, value in user_info.items():
+                    st.session_state[key] = value
+                
+                # 记录登录日志（使用安全的方式）
+                try:
+                    log_user_action('LOGIN', 'system', username)
+                except Exception as log_error:
+                    logging.warning(f"登录日志记录失败: {log_error}")
+                
+                return user_info
+            else:
+                logging.warning(f"用户 {username} 密码验证失败")
+        else:
+            if user:
+                logging.warning(f"用户 {username} 账户被禁用")
+            else:
+                logging.warning(f"用户 {username} 不存在")
+                
+    except Exception as e:
+        logging.error(f"登录查询错误: {e}")
+    
+    return None
+
+def logout_user():
+    """用户登出"""
+    username = st.session_state.get('username', '')
+    if username:
+        try:
+            log_user_action('LOGOUT', 'system', username)
+        except Exception as e:
+            logging.warning(f"登出日志记录失败: {e}")
+    
+    # 清除会话状态
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+
+def get_all_users():
+    """获取所有用户列表"""
+    if not has_permission('manage_users'):
+        logging.warning("当前用户无权限获取用户列表")
+        return []
+
+    query = """
+    SELECT 
+        u.user_id,
+        u.username,
+        u.full_name,
+        u.email,
+        u.is_active,
+        COALESCE(r.role_name, u.role) as role_name,
+        u.created_at
+    FROM users u
+    LEFT JOIN roles r ON u.role_id = r.role_id
+    ORDER BY u.created_at DESC
+    """
+    
+    try:
+        return execute_query(query, fetch_all=True) or []
+    except Exception as e:
+        logging.error(f"获取用户列表失败: {e}")
+        return []
+
+def get_all_roles():
+    """获取所有角色"""
+    query = "SELECT role_id, role_name, description FROM roles ORDER BY role_id"
+    try:
+        return execute_query(query, fetch_all=True) or []
+    except Exception as e:
+        logging.error(f"获取角色列表失败: {e}")
+        return []
+
+def create_user(username: str, password: str, full_name: str, role_id: int, email: str = None):
+    """创建新用户"""
+    if not has_permission('manage_users'):
+        return False, "权限不足"
+    
+    try:
+        # 检查用户名是否已存在
+        existing_user = execute_query(
+            "SELECT user_id FROM users WHERE username = %s", 
+            params=(username,), 
+            fetch_one=True
+        )
+        
+        if existing_user:
+            return False, f"用户名 '{username}' 已存在"
+        
+        # 加密密码
+        password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        
+        # 插入新用户
+        query = """
+        INSERT INTO users (username, password_hash, full_name, role_id, email, is_active)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING user_id
+        """
+        
+        result = execute_query(
+            query, 
+            params=(username, password_hash, full_name, role_id, email, True),
+            fetch_one=True,
+            commit=True
+        )
+        
+        if result:
+            log_user_action('CREATE_USER', 'users', str(result['user_id']))
+            return True, f"用户 '{username}' 创建成功"
+        else:
+            return False, "用户创建失败"
+            
+    except Exception as e:
+        logging.error(f"创建用户失败: {e}")
+        return False, f"创建用户时发生错误: {str(e)}"
+
+def update_user_status(user_id: int, is_active: bool):
+    """更新用户状态"""
+    if not has_permission('manage_users'):
+        return False, "权限不足"
+    
+    try:
+        query = "UPDATE users SET is_active = %s, updated_at = NOW() WHERE user_id = %s"
+        execute_query(query, params=(is_active, user_id), commit=True)
+        
+        action = 'ENABLE_USER' if is_active else 'DISABLE_USER'
+        log_user_action(action, 'users', str(user_id))
+        
+        status_text = "启用" if is_active else "禁用"
+        return True, f"用户已{status_text}"
+        
+    except Exception as e:
+        logging.error(f"更新用户状态失败: {e}")
+        return False, f"更新失败: {str(e)}"
+
+def validate_password_strength(password: str):
+    """验证密码强度"""
+    if len(password) < 8:
+        return False, "密码长度至少8位"
+    
+    if not any(c.isupper() for c in password):
+        return False, "密码必须包含大写字母"
+    
+    if not any(c.islower() for c in password):
+        return False, "密码必须包含小写字母"
+    
+    if not any(c.isdigit() for c in password):
+        return False, "密码必须包含数字"
+    
+    return True, "密码强度符合要求"
+
+def get_user_activity_log(user_id: int = None, days: int = 7):
+    """获取用户活动日志"""
+    if not has_permission('manage_users'):
+        return []
+    
+    base_query = """
+    SELECT 
+        sl.log_id,
+        sl.user_id,
+        u.username,
+        u.full_name,
+        sl.action_type,
+        sl.target_resource,
+        sl.target_id,
+        sl.details,
+        sl.ip_address,
+        sl.timestamp
+    FROM system_logs sl
+    LEFT JOIN users u ON sl.user_id = u.user_id
+    WHERE sl.timestamp >= NOW() - INTERVAL '%s days'
+    """
+    
+    params = [days]
+    
+    if user_id:
+        base_query += " AND sl.user_id = %s"
+        params.append(user_id)
+    
+    base_query += " ORDER BY sl.timestamp DESC LIMIT 1000"
+    
+    try:
+        return execute_query(base_query, params=tuple(params), fetch_all=True) or []
+    except Exception as e:
+        logging.error(f"获取活动日志失败: {e}")
+        return []
+
+def log_user_action(action_type: str, target_resource: str, target_id: str, details: dict = None):
+    """记录用户操作日志"""
+    user_id = st.session_state.get('user_id')
+    if not user_id:
+        return
+    
+    # 检查 system_logs 表是否存在
+    try:
+        # 先检查表结构
+        check_query = """
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'system_logs' AND column_name = 'user_id'
+        """
+        
+        column_exists = execute_query(check_query, fetch_one=True)
+        
+        if not column_exists:
+            logging.warning("system_logs 表的 user_id 字段不存在，跳过日志记录")
+            return
+        
+        # 插入日志
+        query = """
+        INSERT INTO system_logs (user_id, action_type, target_resource, target_id, details, timestamp)
+        VALUES (%s, %s, %s, %s, %s, NOW())
+        """
+        
+        details_json = json.dumps(details) if details else None
+        
+        execute_query(
+            query,
+            params=(user_id, action_type, target_resource, target_id, details_json),
+            commit=True
+        )
+        
+    except Exception as e:
+        # 不让日志记录错误影响主要功能
+        logging.warning(f"记录操作日志失败: {e}")
+
+def update_user_password(user_id: int, new_password: str):
+    """更新用户密码"""
+    if not has_permission('manage_users'):
+        return False, "权限不足"
+    
+    # 验证密码强度
+    is_valid, msg = validate_password_strength(new_password)
+    if not is_valid:
+        return False, msg
+    
+    try:
+        # 加密新密码
+        password_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        
+        # 更新密码
+        query = "UPDATE users SET password_hash = %s, updated_at = NOW() WHERE user_id = %s"
+        execute_query(query, params=(password_hash, user_id), commit=True)
+        
+        log_user_action('UPDATE_PASSWORD', 'users', str(user_id))
+        return True, "密码更新成功"
+        
+    except Exception as e:
+        logging.error(f"更新密码失败: {e}")
+        return False, f"更新失败: {str(e)}"

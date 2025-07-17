@@ -1,0 +1,58 @@
+# app/main.py
+import streamlit as st
+from utils.auth import login_user  # 假设你的认证函数在auth.py中
+
+# --- 页面配置 ---
+st.set_page_config(
+    page_title="模具管理系统",
+    page_icon="🛠️",
+    layout="wide"
+)
+
+# --- 会话状态初始化 ---
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
+if 'username' not in st.session_state:
+    st.session_state['username'] = ''
+if 'role' not in st.session_state:
+    st.session_state['role'] = ''
+
+# --- 登录逻辑 ---
+def show_login_form():
+    """显示登录表单"""
+    with st.form("login_form"):
+        st.title("蕴杰模具全生命周期管理系统")
+        username = st.text_input("用户名", key="login_username")
+        password = st.text_input("密码", type="password", key="login_password")
+        submitted = st.form_submit_button("登录")
+
+        if submitted:
+            user_info = login_user(username, password) # 调用你的登录验证函数
+            if user_info:
+                st.session_state['logged_in'] = True
+                st.session_state['username'] = user_info['username']
+                st.session_state['role'] = user_info['role']
+                st.rerun() # 重新运行脚本以显示主应用
+            else:
+                st.error("用户名或密码错误")
+
+# --- 主程序流 ---
+if not st.session_state['logged_in']:
+    show_login_form()
+else:
+    # 用户已登录
+    st.sidebar.success(f"欢迎, {st.session_state['username']}!")
+    st.sidebar.write(f"角色: {st.session_state['role']}")
+
+    if st.sidebar.button("退出登录"):
+        # 清理会话状态并重新运行以显示登录页面
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+    # --- 欢迎页面 ---
+    st.title("欢迎使用模具管理系统")
+    st.write("请从左侧的导航栏选择一个功能模块开始操作。")
+    
+    # 这里的代码只会在用户登录后，且没有选择任何其他页面时显示
+    # Streamlit 会自动处理页面的显示

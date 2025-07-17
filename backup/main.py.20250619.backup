@@ -1,0 +1,479 @@
+# main.py - 更新版本，集成维修保养模块
+import streamlit as st
+import sys
+from pathlib import Path
+
+# 添加项目根目录到Python路径
+project_root = Path(__file__).parent
+sys.path.append(str(project_root))
+
+# 导入各个页面模块
+try:
+    from pages import mold_management, loan_management, maintenance_management
+    from pages import system_management
+    from utils.database import test_connection
+    from utils.auth import authenticate_user, has_permission, get_current_user_info
+except ImportError as e:
+    st.error(f"模块导入失败: {e}")
+    st.stop()
+
+# 配置页面
+st.set_page_config(
+    page_title="蕴杰金属冲压模具管理系统",
+    page_icon="🔧",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# CSS样式
+st.markdown("""
+<style>
+    .main-header {
+        text-align: center;
+        color: #1f77b4;
+        margin-bottom: 30px;
+        padding: 20px;
+        background: linear-gradient(90deg, #f0f2f6 0%, #ffffff 100%);
+        border-radius: 10px;
+        border-left: 5px solid #1f77b4;
+    }
+    .metric-card {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin: 10px 0;
+        border-left: 4px solid #1f77b4;
+    }
+    .nav-button {
+        width: 100%;
+        margin: 5px 0;
+        padding: 10px;
+        background: linear-gradient(45deg, #1f77b4, #ff7f0e);
+        color: white;
+        border: none;
+        border-radius: 5px;
+        font-weight: bold;
+    }
+    .nav-button:hover {
+        background: linear-gradient(45deg, #0d47a1, #e65100);
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    }
+    .status-urgent { color: #d32f2f; font-weight: bold; }
+    .status-warning { color: #f57c00; font-weight: bold; }
+    .status-normal { color: #388e3c; font-weight: bold; }
+    .sidebar-section {
+        background: #f8f9fa;
+        padding: 15px;
+        border-radius: 8px;
+        margin: 10px 0;
+        border-left: 3px solid #1f77b4;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+def init_session_state():
+    """初始化会话状态"""
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    if 'logged_in' not in st.session_state:
+        st.session_state.logged_in = False
+    if 'user_id' not in st.session_state:
+        st.session_state.user_id = None
+    if 'username' not in st.session_state:
+        st.session_state.username = None
+    if 'user_role' not in st.session_state:
+        st.session_state.user_role = None
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = 'dashboard'
+
+def show_login():
+    """显示登录页面"""
+    st.markdown('<div class="main-header"><h1>🔧 蕴杰金属冲压模具管理系统</h1><p>请登录以访问系统功能</p></div>', unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        with st.form("login_form"):
+            st.markdown("### 🔐 用户登录")
+            username = st.text_input("用户名", placeholder="请输入用户名")
+            password = st.text_input("密码", type="password", placeholder="请输入密码")
+            
+            submitted = st.form_submit_button("登录", use_container_width=True)
+            
+            if submitted:
+                if username and password:
+                    # 使用实际的认证函数
+                    user_info = authenticate_user(username, password)
+                    
+                    if user_info:
+                        st.session_state.authenticated = True
+                        st.session_state.logged_in = True
+                        st.session_state.user_id = user_info['user_id']
+                        st.session_state.username = user_info['username']
+                        st.session_state.user_role = user_info['role_name']
+                        st.session_state.full_name = user_info['full_name']
+                        st.success(f"欢迎 {user_info['full_name']}！")
+                        st.rerun()
+                    else:
+                        st.error("用户名或密码错误")
+                else:
+                    st.error("请输入用户名和密码")
+        
+        # 显示演示账户信息
+        with st.expander("💡 演示账户信息", expanded=False):
+            st.markdown("""
+            **测试账户：**
+            - 超级管理员: `admin` / `admin123`
+            - 模具库管理员: `mold_admin` / `mold123` 
+            - 模具工: `technician` / `tech123`
+            - 冲压操作工: `operator` / `op123`
+            """)
+
+def show_sidebar():
+    """显示侧边栏导航"""
+    with st.sidebar:
+        # 用户信息
+        st.markdown(f'<div class="sidebar-section">', unsafe_allow_html=True)
+        st.markdown(f"**👤 {st.session_state.get('full_name', '用户')}**")
+        st.markdown(f"**📋 {st.session_state.get('user_role', '角色')}**")
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+        # 导航菜单
+        st.markdown("### 📋 功能菜单")
+        
+        user_role = st.session_state.get('user_role', '')
+        
+        # 根据角色显示不同的菜单
+        menu_items = []
+        
+        # 仪表板 - 所有用户都可以访问
+        menu_items.append(("📊 系统概览", "dashboard"))
+        
+        # 模具管理 - 管理员和模具库管理员
+        if user_role in ['超级管理员', '模具库管理员']:
+            menu_items.append(("📋 模具管理", "mold_management"))
+        
+        # 模具查询 - 冲压操作工只能查询
+        if user_role == '冲压操作工':
+            menu_items.append(("🔍 模具查询", "mold_query"))
+        
+        # 借用管理 - 除超级管理员外的所有用户
+        if user_role in ['模具库管理员', '冲压操作工']:
+            menu_items.append(("🛠️ 借用管理", "loan_management"))
+        
+        # 维修保养 - 管理员和模具工
+        if user_role in ['超级管理员', '模具库管理员', '模具工']:
+            menu_items.append(("🔧 维修保养", "maintenance_management"))
+        
+        # 系统管理 - 仅超级管理员
+        if user_role == '超级管理员':
+            menu_items.append(("⚙️ 系统管理", "system_management"))
+
+        # 显示菜单按钮
+        for menu_text, menu_key in menu_items:
+            if st.button(menu_text, key=f"nav_{menu_key}", use_container_width=True):
+                st.session_state.current_page = menu_key
+                # 清除相关的跳转状态
+                for key in ['maintenance_tab', 'create_maintenance_mold_id', 'update_task_id']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
+        
+        st.markdown("---")
+        
+        # 快速操作
+        st.markdown("### ⚡ 快速操作")
+        
+        # 维修预警快捷方式
+        if user_role in ['超级管理员', '模具库管理员', '模具工']:
+            if st.button("⚠️ 维修预警", key="quick_alerts", use_container_width=True):
+                st.session_state.current_page = "maintenance_management"
+                st.session_state.maintenance_tab = "alerts"
+                st.rerun()
+        
+        # 新建借用申请快捷方式
+        if user_role == '冲压操作工':
+            if st.button("📝 新建借用", key="quick_loan", use_container_width=True):
+                st.session_state.current_page = "loan_management"
+                st.rerun()
+        
+        st.markdown("---")
+        
+        # 登出按钮
+        if st.button("🚪 登出", key="logout", use_container_width=True):
+            from utils.auth import logout_user
+            logout_user()
+            st.rerun()
+
+def show_dashboard():
+    """显示系统概览仪表板"""
+    st.markdown('<div class="main-header"><h1>📊 系统概览</h1><p>蕴杰金属冲压模具管理系统</p></div>', unsafe_allow_html=True)
+    
+    try:
+        from utils.database import execute_query
+        
+        # 获取基础统计数据
+        stats_queries = {
+            'total_molds': "SELECT COUNT(*) FROM molds",
+            'available_molds': "SELECT COUNT(*) FROM molds m JOIN mold_statuses ms ON m.current_status_id = ms.status_id WHERE ms.status_name = '闲置'",
+            'in_use_molds': "SELECT COUNT(*) FROM molds m JOIN mold_statuses ms ON m.current_status_id = ms.status_id WHERE ms.status_name IN ('使用中', '已借出')",
+            'maintenance_molds': "SELECT COUNT(*) FROM molds m JOIN mold_statuses ms ON m.current_status_id = ms.status_id WHERE ms.status_name IN ('维修中', '保养中', '待维修', '待保养')"
+        }
+        
+        stats = {}
+        for key, query in stats_queries.items():
+            try:
+                result = execute_query(query, fetch_all=True)
+                stats[key] = result[0][0] if result else 0
+            except:
+                stats[key] = 0
+        
+        # 显示统计卡片
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("🏭 模具总数", stats['total_molds'])
+        
+        with col2:
+            st.metric("✅ 可用模具", stats['available_molds'])
+        
+        with col3:
+            st.metric("🔄 使用中", stats['in_use_molds'])
+        
+        with col4:
+            st.metric("🔧 维护中", stats['maintenance_molds'])
+        
+        # 根据用户角色显示不同的详细信息
+        user_role = st.session_state.get('user_role', '')
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### 📋 快速访问")
+            
+            if user_role in ['超级管理员', '模具库管理员']:
+                if st.button("📋 模具管理", key="dash_mold_mgmt", use_container_width=True):
+                    st.session_state.current_page = "mold_management"
+                    st.rerun()
+                
+                if st.button("🔧 维修保养", key="dash_maintenance", use_container_width=True):
+                    st.session_state.current_page = "maintenance_management"
+                    st.rerun()
+            
+            if user_role in ['模具库管理员', '冲压操作工']:
+                if st.button("🛠️ 借用管理", key="dash_loan", use_container_width=True):
+                    st.session_state.current_page = "loan_management"
+                    st.rerun()
+            
+            if user_role == '冲压操作工':
+                if st.button("🔍 模具查询", key="dash_query", use_container_width=True):
+                    st.session_state.current_page = "mold_query"
+                    st.rerun()
+        
+        with col2:
+            st.markdown("### ⚠️ 系统提醒")
+            
+            # 获取维修预警信息（如果用户有权限）
+            if user_role in ['超级管理员', '模具库管理员', '模具工']:
+                try:
+                    alert_query = """
+                    SELECT 
+                        COUNT(*) as alert_count,
+                        'urgent' as alert_type
+                    FROM molds m
+                    JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+                    WHERE ms.status_name IN ('待维修', '待保养')
+                    
+                    UNION ALL
+                    
+                    SELECT 
+                        COUNT(*) as alert_count,
+                        'overdue' as alert_type
+                    FROM molds m
+                    WHERE m.maintenance_cycle_strokes > 0 
+                    AND m.accumulated_strokes >= m.maintenance_cycle_strokes
+                    
+                    UNION ALL
+                    
+                    SELECT 
+                        COUNT(*) as alert_count,
+                        'warning' as alert_type
+                    FROM molds m
+                    WHERE m.theoretical_lifespan_strokes > 0 
+                    AND m.accumulated_strokes >= m.theoretical_lifespan_strokes * 0.9
+                    """
+                    
+                    alerts = execute_query(alert_query, fetch_all=True)
+                    
+                    for alert in alerts:
+                        count = alert[0]
+                        alert_type = alert[1]
+                        
+                        if count > 0:
+                            if alert_type == 'urgent':
+                                st.error(f"🚨 {count} 个模具需要紧急维修/保养")
+                            elif alert_type == 'overdue':
+                                st.warning(f"⏰ {count} 个模具保养超期")
+                            elif alert_type == 'warning':
+                                st.info(f"⚡ {count} 个模具即将到期")
+                    
+                    # 如果有预警，显示快速跳转按钮
+                    total_alerts = sum([alert[0] for alert in alerts])
+                    if total_alerts > 0:
+                        if st.button("🔧 查看维修预警", key="dash_alerts", use_container_width=True):
+                            st.session_state.current_page = "maintenance_management"
+                            st.session_state.maintenance_tab = "alerts"
+                            st.rerun()
+                    else:
+                        st.success("✅ 当前没有维修预警")
+                
+                except Exception as e:
+                    st.warning("无法获取预警信息")
+            
+            # 显示近期活动（如果有）
+            try:
+                recent_activity_query = """
+                SELECT 
+                    'maintenance' as activity_type,
+                    COUNT(*) as count
+                FROM mold_maintenance_logs
+                WHERE maintenance_start_timestamp >= CURRENT_DATE - INTERVAL '7 days'
+                
+                UNION ALL
+                
+                SELECT 
+                    'loan' as activity_type,
+                    COUNT(*) as count
+                FROM mold_loan_records
+                WHERE application_timestamp >= CURRENT_DATE - INTERVAL '7 days'
+                """
+                
+                activities = execute_query(recent_activity_query, fetch_all=True)
+                
+                st.markdown("**📈 近7天活动**")
+                for activity in activities:
+                    activity_type = activity[1]
+                    count = activity[0]
+                    
+                    if activity_type == 'maintenance':
+                        st.write(f"🔧 维修保养: {count} 次")
+                    elif activity_type == 'loan':
+                        st.write(f"📋 借用申请: {count} 次")
+            
+            except:
+                pass
+    
+    except Exception as e:
+        st.error(f"获取系统概览数据失败: {e}")
+        
+        # 显示静态欢迎信息
+        st.markdown("""
+        ### 👋 欢迎使用蕴杰金属冲压模具管理系统
+        
+        **系统功能：**
+        - 📋 模具台账管理
+        - 🛠️ 模具借用流程
+        - 🔧 维修保养管理
+        - 📊 统计分析报表
+        
+        请使用左侧菜单访问各功能模块。
+        """)
+
+def show_mold_query():
+    """显示模具查询页面（只读版本，供冲压操作工使用）"""
+    st.title("🔍 模具查询")
+    
+    # 调用模具管理模块的只读查询功能
+    try:
+        mold_management.show_mold_list_readonly()
+    except AttributeError:
+        # 如果没有只读函数，使用基本的查询显示
+        st.info("模具查询功能正在开发中...")
+
+# 在 main.py 中替换 show_system_management 函数
+
+def show_system_management():
+    """显示系统管理页面（仅超级管理员）"""
+    # 权限检查
+    if st.session_state.get('user_role') != '超级管理员':
+        st.error("权限不足：仅超级管理员可以访问此功能")
+        return
+    
+    # 导入系统管理模块
+    try:
+        from pages import system_management
+        system_management.show()
+    except ImportError:
+        # 如果模块还未创建，显示原来的简单版本
+        st.title("⚙️ 系统管理")
+        
+        tab1, tab2, tab3 = st.tabs(["👥 用户管理", "🔧 系统配置", "📊 系统监控"])
+        
+        with tab1:
+            st.markdown("### 👥 用户管理")
+            st.info("用户管理功能开发中...")
+        
+        with tab2:
+            st.markdown("### 🔧 系统配置")
+            st.info("系统配置功能开发中...")
+            
+            # 数据库连接测试
+            st.markdown("#### 数据库连接测试")
+            if st.button("测试数据库连接"):
+                if test_connection():
+                    st.success("✅ 数据库连接正常")
+                else:
+                    st.error("❌ 数据库连接失败")
+        
+        with tab3:
+            st.markdown("### 📊 系统监控")
+            st.info("系统监控功能开发中...")
+
+# 同时，在 main.py 的导入部分添加（如果还没有的话）：
+# from pages import system_management  # 在需要时导入
+
+def main():
+    """主函数"""
+    init_session_state()
+    
+    # 检查用户是否已登录
+    if not st.session_state.get('logged_in', False):
+        show_login()
+        return
+    
+    # 显示侧边栏
+    show_sidebar()
+    
+    # 根据当前页面显示相应内容
+    current_page = st.session_state.get('current_page', 'dashboard')
+    
+    try:
+        if current_page == 'dashboard':
+            show_dashboard()
+        elif current_page == 'mold_management':
+            mold_management.show()
+        elif current_page == 'mold_query':
+            show_mold_query()
+        elif current_page == 'loan_management':
+            loan_management.show()
+        elif current_page == 'maintenance_management':
+            maintenance_management.show()
+        elif current_page == 'system_management':
+            show_system_management()
+        else:
+            st.error(f"未知页面: {current_page}")
+            show_dashboard()
+    
+    except Exception as e:
+        st.error(f"页面加载失败: {e}")
+        st.exception(e)
+        
+        # 提供返回主页的选项
+        if st.button("🏠 返回主页"):
+            st.session_state.current_page = 'dashboard'
+            st.rerun()
+
+if __name__ == "__main__":
+    main()

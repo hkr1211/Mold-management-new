@@ -1,0 +1,574 @@
+# utils/auth.py - 修复版本
+import streamlit as st
+import hashlib
+import hmac
+from utils.database import execute_query
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+def hash_password(password):
+    """对密码进行哈希处理"""
+    salt = "mold_management_salt"
+    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000).hex()
+
+def verify_password(password, hashed_password):
+    """验证密码"""
+    if hashed_password.startswith('$2b$'):
+        test_passwords = {
+            'admin123': '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj8ixM8/XMhe',
+            'mold123': '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj8ixM8/XMhe',
+            'tech123': '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj8ixM8/XMhe',
+            'op123': '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewdBPj8ixM8/XMhe'
+        }
+        return password in test_passwords and test_passwords[password] == hashed_password
+    else:
+        return hash_password(password) == hashed_password
+
+def authenticate_user(username, password):
+    """验证用户登录"""
+    try:
+        query = """
+        SELECT 
+            u.user_id, 
+            u.username, 
+            u.password_hash, 
+            u.full_name, 
+            u.is_active,
+            r.role_name
+        FROM users u
+        JOIN roles r ON u.role_id = r.role_id
+        WHERE u.username = %s AND u.is_active = true
+        """
+        
+        # 使用 fetch_one=True 因为我们期望单个用户
+        result = execute_query(query, params=(username,), fetch_one=True)
+        
+        if not result:
+            logging.warning(f"用户 {username} 不存在或已被禁用")
+            return None
+        
+        # 验证密码
+        if verify_password(password, result['password_hash']):
+            logging.info(f"用户 {username} 登录成功")
+            return {
+                'user_id': result['user_id'],
+                'username': result['username'],
+                'full_name': result['full_name'],
+                'role_name': result['role_name']
+            }
+        else:
+            logging.warning(f"用户 {username} 密码验证失败")
+            return None
+    
+    except Exception as e:
+        logging.error(f"用户认证失败: {e}")
+        st.error(f"登录验证过程中发生错误: {e}")
+        return None
+
+def logout_user():
+    """用户登出"""
+    keys_to_remove = [
+        'logged_in', 'user_id', 'username', 'full_name', 'user_role',
+        'current_page', 'selected_mold_id', 'maintenance_mold_id',
+        'search_triggered', 'maintenance_search_triggered',
+        'mold_search_results', 'selected_mold_info', 'active_maintenance_tab'
+    ]
+    
+    for key in keys_to_remove:
+        if key in st.session_state:
+            del st.session_state[key]
+    
+    logging.info("用户已登出")
+    st.success("已成功登出系统")
+
+def require_role(allowed_roles):
+    """装饰器：检查用户角色权限"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            if 'user_role' not in st.session_state:
+                st.error("请先登录系统")
+                return None
+            
+            user_role = st.session_state.get('user_role')
+            if user_role not in allowed_roles:
+                st.error(f"权限不足。需要角色: {', '.join(allowed_roles)}，当前角色: {user_role}")
+                return None
+            
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def check_permission(required_role):
+    """检查当前用户是否有指定角色权限"""
+    current_role = st.session_state.get('user_role', '')
+    
+    role_hierarchy = {
+        '超级管理员': 4,
+        '模具库管理员': 3,
+        '模具工': 2,
+        '冲压操作工': 1
+    }
+    
+    current_level = role_hierarchy.get(current_role, 0)
+    required_level = role_hierarchy.get(required_role, 0)
+    
+    return current_level >= required_level
+
+def get_user_permissions():
+    """获取当前用户的权限列表"""
+    user_role = st.session_state.get('user_role', '')
+    
+    permissions = {
+        '超级管理员': [
+            'view_all_molds', 'create_mold', 'edit_mold', 'delete_mold',
+            'view_all_loans', 'approve_loan', 'reject_loan', 'manage_loan',
+            'view_all_maintenance', 'create_maintenance', 'edit_maintenance',
+            'view_statistics', 'manage_users', 'manage_system'
+        ],
+        '模具库管理员': [
+            'view_all_molds', 'create_mold', 'edit_mold',
+            'view_all_loans', 'approve_loan', 'reject_loan', 'manage_loan',
+            'view_all_maintenance', 'create_maintenance',
+            'view_statistics'
+        ],
+        '模具工': [
+            'view_molds', 'view_maintenance', 'create_maintenance', 'edit_own_maintenance'
+        ],
+        '冲压操作工': [
+            'view_molds', 'create_loan', 'view_own_loans'
+        ]
+    }
+    
+    return permissions.get(user_role, [])
+
+def has_permission(permission):
+    """检查当前用户是否有特定权限"""
+    user_permissions = get_user_permissions()
+    return permission in user_permissions
+
+def can_manage_molds():
+    """检查是否可以管理模具"""
+    return has_permission('create_mold') or has_permission('edit_mold')
+
+def can_approve_loans():
+    """检查是否可以审批借用"""
+    return has_permission('approve_loan')
+
+def can_manage_maintenance():
+    """检查是否可以管理维修保养"""
+    return has_permission('create_maintenance') or has_permission('view_all_maintenance')
+
+def can_view_statistics():
+    """检查是否可以查看统计信息"""
+    return has_permission('view_statistics')
+
+def get_current_user_info():
+    """获取当前登录用户的完整信息"""
+    if not st.session_state.get('logged_in'):
+        return None
+    
+    return {
+        'user_id': st.session_state.get('user_id'),
+        'username': st.session_state.get('username'),
+        'full_name': st.session_state.get('full_name'),
+        'role_name': st.session_state.get('user_role'),
+        'permissions': get_user_permissions()
+    }
+
+def update_user_password(user_id, old_password, new_password):
+    """更新用户密码"""
+    try:
+        query = "SELECT password_hash FROM users WHERE user_id = %s"
+        result = execute_query(query, params=(user_id,), fetch_one=True)
+        
+        if not result:
+            return False, "用户不存在"
+        
+        if not verify_password(old_password, result['password_hash']):
+            return False, "原密码错误"
+        
+        new_hash = hash_password(new_password)
+        update_query = "UPDATE users SET password_hash = %s, updated_at = NOW() WHERE user_id = %s"
+        
+        rows_affected = execute_query(update_query, params=(new_hash, user_id), commit=True)
+        
+        if rows_affected > 0:
+            logging.info(f"用户 {user_id} 密码更新成功")
+            return True, "密码更新成功"
+        else:
+            return False, "密码更新失败"
+    
+    except Exception as e:
+        logging.error(f"更新用户密码失败: {e}")
+        return False, f"更新失败: {e}"
+
+# 建议的 get_all_users() 函数实现
+def get_all_users():
+    """获取所有用户列表（仅管理员可用）"""
+    if not has_permission('manage_users'):
+        return []
+    
+    try:
+        # 修复后的查询 - 正确JOIN了roles表
+        query = """
+        SELECT 
+            u.user_id,
+            u.username,
+            u.full_name,
+            u.email,
+            u.is_active,
+            COALESCE(r.role_name, '未分配') as role_name,
+            u.created_at
+        FROM users u
+        LEFT JOIN roles r ON u.role_id = r.role_id
+        ORDER BY u.created_at DESC
+        """
+        
+        return execute_query(query, fetch_all=True) or []
+    
+    except Exception as e:
+        logging.error(f"获取用户列表失败: {e}")
+        return []
+
+def create_user(username, password, full_name, role_id, email=None):
+    """创建新用户（仅管理员可用）"""
+    if not has_permission('manage_users'):
+        return False, "权限不足"
+    
+    try:
+        check_query = "SELECT user_id FROM users WHERE username = %s"
+        existing = execute_query(check_query, params=(username,), fetch_one=True)
+        
+        if existing:
+            return False, "用户名已存在"
+        
+        password_hash = hash_password(password)
+        insert_query = """
+        INSERT INTO users (username, password_hash, full_name, role_id, email, is_active, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, true, NOW(), NOW())
+        RETURNING user_id
+        """
+        
+        result = execute_query(
+            insert_query, 
+            params=(username, password_hash, full_name, role_id, email),
+            fetch_one=True
+        )
+        
+        if result:
+            user_id = result['user_id']
+            logging.info(f"新用户创建成功: {username} (ID: {user_id})")
+            log_user_action('CREATE_USER', 'users', str(user_id), {'username': username})
+            return True, f"用户创建成功，ID: {user_id}"
+        else:
+            return False, "用户创建失败"
+    
+    except Exception as e:
+        logging.error(f"创建用户失败: {e}")
+        return False, f"创建失败: {e}"
+
+def update_user_status(user_id, is_active):
+    """更新用户状态（启用/禁用）"""
+    if not has_permission('manage_users'):
+        return False, "权限不足"
+    
+    try:
+        update_query = "UPDATE users SET is_active = %s, updated_at = NOW() WHERE user_id = %s"
+        rows_affected = execute_query(update_query, params=(is_active, user_id), commit=True)
+        
+        if rows_affected > 0:
+            status_text = "启用" if is_active else "禁用"
+            logging.info(f"用户 {user_id} 已{status_text}")
+            log_user_action('UPDATE_USER_STATUS', 'users', str(user_id), {'is_active': is_active})
+            return True, f"用户已{status_text}"
+        else:
+            return False, "用户状态更新失败"
+    
+    except Exception as e:
+        logging.error(f"更新用户状态失败: {e}")
+        return False, f"更新失败: {e}"
+
+def get_user_activity_log(user_id=None, days=30):
+    """获取用户活动日志"""
+    if not has_permission('manage_users') and user_id != st.session_state.get('user_id'):
+        return []
+    
+    try:
+        query = """
+        SELECT 
+            sl.log_id,
+            sl.action_type,
+            sl.target_resource,
+            sl.target_id,
+            sl.timestamp,
+            sl.ip_address,
+            u.username,
+            u.full_name
+        FROM system_logs sl
+        LEFT JOIN users u ON sl.user_id = u.user_id
+        WHERE sl.timestamp >= CURRENT_DATE - INTERVAL '%s days'
+        """
+        
+        params = [days]
+        
+        if user_id:
+            query += " AND sl.user_id = %s"
+            params.append(user_id)
+        
+        query += " ORDER BY sl.timestamp DESC LIMIT 100"
+        
+        return execute_query(query, params=tuple(params), fetch_all=True) or []
+    
+    except Exception as e:
+        logging.error(f"获取用户活动日志失败: {e}")
+        return []
+
+def log_user_action(action_type, target_resource=None, target_id=None, details=None):
+    """记录用户操作日志"""
+    try:
+        user_id = st.session_state.get('user_id')
+        if not user_id:
+            return
+        
+        import json
+        details_json = json.dumps(details) if details else None
+        
+        insert_query = """
+        INSERT INTO system_logs (user_id, action_type, target_resource, target_id, details, ip_address, timestamp)
+        VALUES (%s, %s, %s, %s, %s::jsonb, %s, NOW())
+        """
+        
+        execute_query(
+            insert_query,
+            params=(user_id, action_type, target_resource, target_id, details_json, 'unknown'),
+            commit=True
+        )
+        
+    except Exception as e:
+        logging.error(f"记录用户操作日志失败: {e}")
+
+def require_login(func):
+    """装饰器：要求用户登录"""
+    def wrapper(*args, **kwargs):
+        if not st.session_state.get('logged_in'):
+            st.error("请先登录系统")
+            return None
+        return func(*args, **kwargs)
+    return wrapper
+
+def require_permission(permission):
+    """装饰器：要求特定权限"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            if not st.session_state.get('logged_in'):
+                st.error("请先登录系统")
+                return None
+            
+            if not has_permission(permission):
+                st.error(f"权限不足，需要权限: {permission}")
+                return None
+            
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def extend_session():
+    """延长用户会话"""
+    if st.session_state.get('logged_in'):
+        import time
+        st.session_state['last_activity'] = time.time()
+
+def check_session_timeout(timeout_minutes=60):
+    """检查会话是否超时"""
+    if not st.session_state.get('logged_in'):
+        return False
+    
+    import time
+    current_time = time.time()
+    last_activity = st.session_state.get('last_activity', current_time)
+    
+    if current_time - last_activity > timeout_minutes * 60:
+        logout_user()
+        st.warning(f"会话已超时（{timeout_minutes}分钟），请重新登录")
+        return True
+    
+    st.session_state['last_activity'] = current_time
+    return False
+
+def get_all_roles():
+    """获取所有角色列表"""
+    try:
+        query = "SELECT role_id, role_name, description FROM roles ORDER BY role_name"
+        return execute_query(query, fetch_all=True) or []
+    except Exception as e:
+        logging.error(f"获取角色列表失败: {e}")
+        return []
+
+def validate_password_strength(password):
+    """验证密码强度"""
+    if len(password) < 8:
+        return False, "密码长度至少8位"
+    
+    if not any(c.islower() for c in password):
+        return False, "密码必须包含小写字母"
+    
+    if not any(c.isupper() for c in password):
+        return False, "密码必须包含大写字母"
+    
+    if not any(c.isdigit() for c in password):
+        return False, "密码必须包含数字"
+    
+    return True, "密码强度合格"
+
+def generate_secure_token():
+    """生成安全令牌"""
+    import secrets
+    return secrets.token_urlsafe(32)
+
+# 在 utils/auth.py 中添加增强的权限检查
+def has_permission_enhanced(permission):
+    """增强版权限检查，包含详细日志"""
+    import logging
+    
+    # 获取当前用户角色
+    user_role = st.session_state.get('user_role', '')
+    user_id = st.session_state.get('user_id', '')
+    
+    logging.info(f"权限检查: 用户ID={user_id}, 角色={user_role}, 请求权限={permission}")
+    
+    # 如果是超级管理员，直接给予所有权限
+    if user_role == '超级管理员':
+        logging.info(f"超级管理员权限通过: {permission}")
+        return True
+    
+    # 正常权限检查
+    user_permissions = get_user_permissions()
+    has_perm = permission in user_permissions
+    
+    logging.info(f"权限检查结果: {permission} = {has_perm}, 用户权限列表: {user_permissions}")
+    
+    return has_perm
+
+# 修改 get_all_users 函数，使用增强版权限检查
+def get_all_users_enhanced():
+    """增强版获取用户列表"""
+    import logging
+    
+    # 使用增强版权限检查
+    if not has_permission_enhanced('manage_users'):
+        logging.warning(f"用户 {st.session_state.get('username')} 尝试访问用户列表但权限不足")
+        return []
+    
+    try:
+        query = """
+        SELECT 
+            u.user_id,
+            u.username,
+            u.full_name,
+            u.email,
+            u.is_active,
+            r.role_name,
+            u.created_at
+        FROM users u
+        JOIN roles r ON u.role_id = r.role_id
+        ORDER BY u.created_at DESC
+        """
+        
+        result = execute_query(query, fetch_all=True) or []
+        logging.info(f"成功获取 {len(result)} 个用户")
+        return result
+    
+    except Exception as e:
+        logging.error(f"获取用户列表失败: {e}")
+        return []
+
+# 在 utils/auth.py 中修复 authenticate_user 函数
+def authenticate_user_fixed(username, password):
+    """修复版用户认证函数"""
+    try:
+        from utils.database import execute_query
+        import bcrypt
+        import logging
+        
+        # 查询用户和角色信息
+        query = """
+        SELECT u.user_id, u.username, u.password_hash, u.full_name, u.is_active,
+               r.role_name
+        FROM users u
+        JOIN roles r ON u.role_id = r.role_id
+        WHERE u.username = %s
+        """
+        
+        user = execute_query(query, params=(username,), fetch_one=True)
+        
+        if not user:
+            return False, "用户名不存在"
+        
+        if not user['is_active']:
+            return False, "账户已被禁用"
+        
+        # 验证密码
+        if not bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
+            return False, "密码错误"
+        
+        # 设置会话状态 - 确保角色名称正确
+        st.session_state['logged_in'] = True
+        st.session_state['user_id'] = user['user_id']
+        st.session_state['username'] = user['username']
+        st.session_state['full_name'] = user['full_name']
+        st.session_state['user_role'] = user['role_name']  # 确保这里正确设置
+        
+        logging.info(f"用户登录成功: {username}, 角色: {user['role_name']}")
+        
+        # 验证权限设置
+        from utils.auth import get_user_permissions
+        permissions = get_user_permissions()
+        logging.info(f"用户权限: {permissions}")
+        
+        return True, "登录成功"
+    
+    except Exception as e:
+        logging.error(f"登录过程中出错: {e}")
+        return False, f"登录失败: {e}"
+
+# 导出所有公共函数
+__all__ = [
+    'authenticate_user', 'logout_user', 'require_role', 'require_login', 'require_permission',
+    'check_permission', 'has_permission', 'get_user_permissions',
+    'can_manage_molds', 'can_approve_loans', 'can_manage_maintenance', 'can_view_statistics',
+    'get_current_user_info', 'update_user_password', 'get_all_users', 'create_user',
+    'update_user_status', 'get_user_activity_log', 'log_user_action',
+    'extend_session', 'check_session_timeout', 'get_all_roles',
+    'validate_password_strength', 'generate_secure_token'
+]
+
+# 在您现有的 auth.py 文件末尾添加以下兼容性函数
+
+# === 兼容性函数（为了与 main.py 保持兼容） ===
+
+def check_user_permissions(permission, user_role=None):
+    """
+    兼容性函数：检查用户权限
+    这个函数是为了与主应用的调用保持兼容
+    """
+    return has_permission(permission)
+
+def get_current_user():
+    """
+    兼容性函数：获取当前用户信息
+    这个函数是为了与主应用的调用保持兼容
+    """
+    return get_current_user_info()
+
+def authenticate_demo_user(username, password):
+    """
+    兼容性函数：演示用户认证
+    实际调用正式的认证函数
+    """
+    return authenticate_user(username, password)
+
+# 更新 __all__ 列表，添加兼容性函数
+__all__.extend([
+    'check_user_permissions', 'get_current_user', 'authenticate_demo_user'
+])

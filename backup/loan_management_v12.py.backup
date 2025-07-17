@@ -1,0 +1,437 @@
+# pages/loan_management.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import logging
+from datetime import datetime, timedelta, date
+from utils.database import (
+    execute_query, 
+    get_db_connection,
+    get_loan_statuses, 
+    convert_numpy_types 
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Helper Functions ---
+def get_status_id_by_name(status_name, table_name="loan_statuses", name_column="status_name", id_column="status_id"):
+    """Fetches the ID of a status by its name from a given status table."""
+    query = f"SELECT {id_column} FROM {table_name} WHERE {name_column} = %s"
+    try:
+        result = execute_query(query, params=(status_name,), fetch_all=True)
+        if result and len(result) > 0:
+            return result[0][id_column]
+        else:
+            logging.error(f"Status '{status_name}' not found in table '{table_name}'.")
+            st.error(f"系统错误：无法找到状态 '{status_name}'。请联系管理员。")
+            return None
+    except Exception as e:
+        logging.error(f"Error fetching status ID for '{status_name}' from '{table_name}': {e}")
+        st.error(f"数据库错误：获取状态ID失败。详情：{e}")
+        return None
+
+def get_available_molds_for_loan():
+    """Fetches molds that are currently '闲置' (Idle). Returns a DataFrame."""
+    idle_status_id = get_status_id_by_name("闲置", table_name="mold_statuses")
+    if not idle_status_id:
+        logging.warning("Status '闲置' not found, returning empty DataFrame for available molds.")
+        return pd.DataFrame()
+
+    query = """
+    SELECT 
+        m.mold_id,
+        m.mold_code,
+        m.mold_name,
+        mft.type_name as functional_type,
+        ms.status_name as current_status,
+        sl.location_name as current_location
+    FROM molds m
+    LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
+    JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+    LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+    WHERE m.current_status_id = %s
+    ORDER BY m.mold_code
+    """
+    try:
+        db_results = execute_query(query, params=(idle_status_id,), fetch_all=True)
+        
+        if isinstance(db_results, list):
+            df = pd.DataFrame(db_results)
+            return df
+        elif db_results is None:
+            logging.warning("execute_query returned None for available molds. Returning empty DataFrame.")
+            return pd.DataFrame()
+        else:
+            logging.error(f"get_available_molds_for_loan: execute_query returned unexpected type {type(db_results)}. Value: {db_results}")
+            st.error("获取可用模具列表时数据格式错误。")
+            return pd.DataFrame()
+
+    except Exception as e:
+        logging.error(f"Error in get_available_molds_for_loan: {e}", exc_info=True)
+        st.error(f"加载可用模具列表时出错: {e}")
+        return pd.DataFrame()
+
+# --- Main Application Functions ---
+
+def create_loan_application():
+    """UI and logic for creating a new mold loan application."""
+    st.subheader("📝 新建借用申请")
+
+    current_user_id = st.session_state.get('user_id')
+    if not current_user_id:
+        st.warning("请先登录系统。")
+        return
+
+    df_available_molds = get_available_molds_for_loan()
+    
+    if not isinstance(df_available_molds, pd.DataFrame):
+        st.error("加载可用模具列表时发生内部错误，数据类型不正确。")
+        logging.error(f"create_loan_application expected DataFrame, got {type(df_available_molds)}")
+        df_available_molds = pd.DataFrame(columns=['mold_id', 'mold_code', 'mold_name']) 
+
+    if df_available_molds.empty:
+        st.info("当前没有可供借用的闲置模具。")
+        return
+
+    mold_options = {row['mold_id']: f"{row['mold_code']} - {row['mold_name']}" 
+                    for index, row in df_available_molds.iterrows()}
+    
+    with st.form("loan_application_form"):
+        selected_mold_id = st.selectbox("选择模具:", options=list(mold_options.keys()), format_func=lambda x: mold_options.get(x, "未知模具"))
+        
+        min_return_date = date.today() + timedelta(days=1)
+        expected_return_date_input = st.date_input("预计归还日期:", min_value=min_return_date, value=min_return_date)
+        
+        destination_equipment_input = st.text_input("使用设备/目的地:")
+        remarks_input = st.text_area("备注:")
+        
+        submitted = st.form_submit_button("提交申请")
+
+    if submitted:
+        if not selected_mold_id:
+            st.error("请选择一个模具。")
+            return
+        if not destination_equipment_input.strip():
+            st.error("请填写使用设备/目的地。")
+            return
+        if not expected_return_date_input:
+             st.error("请选择预计归还日期。")
+             return
+
+        try:
+            with get_db_connection() as conn:
+                conn.autocommit = False
+                cursor = conn.cursor()
+
+                # Get required status IDs
+                pending_loan_status_id = get_status_id_by_name("待审批", table_name="loan_statuses")
+
+                if not pending_loan_status_id:
+                    st.error("系统配置错误：无法获取必要的借阅状态ID。请联系管理员。")
+                    conn.rollback()
+                    return
+
+                # Insert loan application using the correct table name
+                insert_loan_query = """
+                INSERT INTO mold_loan_records (
+                    mold_id, applicant_id, application_timestamp, 
+                    expected_return_timestamp, destination_equipment, remarks, loan_status_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """
+                application_timestamp = datetime.now()
+                cursor.execute(insert_loan_query, (
+                    selected_mold_id, current_user_id, application_timestamp,
+                    expected_return_date_input, destination_equipment_input, remarks_input, pending_loan_status_id
+                ))
+
+                conn.commit()
+                st.success("借用申请已成功提交，状态：待审批。")
+                st.rerun()
+
+        except Exception as e:
+            logging.error(f"Loan application submission failed: {e}", exc_info=True)
+            st.error(f"提交申请失败：{e}")
+
+def view_loan_applications():
+    """UI and logic for viewing and managing loan applications."""
+    st.subheader("🔍 查看与管理借用申请")
+
+    current_user_id = st.session_state.get('user_id')
+    current_user_role = st.session_state.get('user_role')
+
+    if not current_user_id:
+        st.warning("请先登录。")
+        return
+
+    # --- Filtering ---
+    try:
+        all_statuses = get_loan_statuses() or []
+        status_filter_options = {0: "全部状态"}
+        status_filter_options.update({row['status_id']: row['status_name'] for row in all_statuses})
+        
+        selected_status_id = st.selectbox(
+            "按状态筛选:",
+            options=list(status_filter_options.keys()),
+            format_func=lambda x: status_filter_options[x],
+            key="loan_status_filter"
+        )
+    except Exception as e:
+        st.error(f"获取状态选项失败: {e}")
+        return
+
+    # --- Fetching Data ---
+    query_base = """
+    SELECT
+        mlr.loan_id, m.mold_code, m.mold_name,
+        u_applicant.full_name AS applicant_name, mlr.application_timestamp,
+        mlr.expected_return_timestamp, mlr.loan_out_timestamp, mlr.actual_return_timestamp,
+        mlr.destination_equipment, ls.status_name AS loan_status, mlr.loan_status_id,
+        u_approver.full_name AS approver_name, mlr.remarks,
+        m.mold_id
+    FROM mold_loan_records mlr
+    JOIN molds m ON mlr.mold_id = m.mold_id
+    JOIN users u_applicant ON mlr.applicant_id = u_applicant.user_id
+    JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
+    LEFT JOIN users u_approver ON mlr.approver_id = u_approver.user_id
+    """
+    
+    params = []
+    if selected_status_id != 0:
+        query_base += " WHERE mlr.loan_status_id = %s"
+        params.append(selected_status_id)
+
+    query_base += " ORDER BY mlr.application_timestamp DESC"
+    
+    try:
+        loan_records = execute_query(query_base, params=tuple(params), fetch_all=True)
+        
+        if not loan_records:
+            st.info("没有找到符合条件的借用申请记录。")
+            return
+            
+        loan_apps_df = pd.DataFrame(loan_records)
+        
+    except Exception as e:
+        logging.error(f"Failed to load loan applications: {e}")
+        st.error(f"加载借用申请列表失败：{e}")
+        return
+
+    status_emoji = {
+        "待审批": "⏳", "已批准": "✅", "已借出": "➡️",
+        "已归还": "📥", "已驳回": "❌", "逾期": "⚠️" 
+    }
+
+    for _, record_series in loan_apps_df.iterrows():
+        record = convert_numpy_types(record_series.to_dict())
+        loan_id = record['loan_id']
+        mold_id = record['mold_id']
+
+        emoji = status_emoji.get(record['loan_status'], "📋")
+        expander_title = f"{emoji} {record['mold_code']} ({record['mold_name']}) - 申请人: {record['applicant_name']} - 状态: {record['loan_status']}"
+        
+        with st.expander(expander_title):
+            details_col, actions_col = st.columns([3, 1])
+
+            with details_col:
+                st.write(f"**申请ID：** {loan_id}")
+                st.write(f"**申请时间：** {record['application_timestamp'].strftime('%Y-%m-%d %H:%M') if pd.notna(record['application_timestamp']) else 'N/A'}")
+                if pd.notna(record['expected_return_timestamp']):
+                    st.write(f"**预计归还：** {record['expected_return_timestamp'].strftime('%Y-%m-%d')}")
+                st.write(f"**使用设备：** {record['destination_equipment']}")
+                if pd.notna(record['loan_out_timestamp']):
+                    st.write(f"**借出时间：** {record['loan_out_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                if pd.notna(record['actual_return_timestamp']):
+                    st.write(f"**归还时间：** {record['actual_return_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                if record['approver_name']:
+                    st.write(f"**审批人：** {record['approver_name']}")
+                if record['remarks']:
+                    st.write(f"**申请备注：** {record['remarks']}")
+            
+            with actions_col:
+                # Define permissions
+                can_approve_reject = current_user_role in ['超级管理员', '模具库管理员']
+                can_manage_loan_flow = current_user_role in ['超级管理员', '模具库管理员']
+
+                if record['loan_status'] == '待审批' and can_approve_reject:
+                    if st.button("✔️ 批准", key=f"approve_{loan_id}", help="批准此申请"):
+                        if approve_loan_application(loan_id, mold_id, current_user_id):
+                            st.rerun()
+                    
+                    rejection_reason = st.text_area("驳回理由:", key=f"reject_reason_{loan_id}", height=100)
+                    if st.button("❌ 驳回", key=f"reject_{loan_id}", help="驳回此申请"):
+                        if not rejection_reason.strip():
+                            st.warning("请输入驳回理由。")
+                        elif reject_loan_application(loan_id, mold_id, current_user_id, rejection_reason):
+                            st.rerun()
+
+                elif record['loan_status'] == '已批准' and can_manage_loan_flow:
+                    if st.button("➡️ 确认借出", key=f"loan_out_{loan_id}", help="确认模具已借出"):
+                        if mark_as_loaned_out(loan_id, mold_id, current_user_id):
+                            st.rerun()
+                
+                elif record['loan_status'] == '已借出' and can_manage_loan_flow:
+                    if st.button("📥 标记归还", key=f"return_{loan_id}", help="标记模具已归还"):
+                        if mark_as_returned(loan_id, mold_id, current_user_id):
+                            st.rerun()
+
+def _update_loan_and_mold_status(loan_id, mold_id,
+                                 current_loan_status_name, target_loan_status_name,
+                                 current_mold_status_name, target_mold_status_name,
+                                 operator_user_id, 
+                                 loan_timestamp_field=None,
+                                 loan_operator_field=None,
+                                 remarks_field=None, remarks_value=None):
+    """Generic function to update loan and mold statuses within a transaction."""
+    try:
+        with get_db_connection() as conn:
+            conn.autocommit = False
+            cursor = conn.cursor()
+
+            # Get status IDs
+            current_loan_status_id = get_status_id_by_name(current_loan_status_name, table_name="loan_statuses")
+            target_loan_status_id = get_status_id_by_name(target_loan_status_name, table_name="loan_statuses")
+            current_mold_status_id = get_status_id_by_name(current_mold_status_name, table_name="mold_statuses")
+            target_mold_status_id = get_status_id_by_name(target_mold_status_name, table_name="mold_statuses")
+
+            if not all([current_loan_status_id, target_loan_status_id, current_mold_status_id, target_mold_status_id]):
+                st.error("系统配置错误：无法获取操作所需的状态ID。")
+                conn.rollback()
+                return False
+
+            # Verify current loan application status
+            cursor.execute("SELECT loan_status_id, mold_id FROM mold_loan_records WHERE loan_id = %s", (loan_id,))
+            app_data = cursor.fetchone()
+            if not app_data or app_data[0] != current_loan_status_id or app_data[1] != mold_id:
+                st.warning(f"操作失败：申请状态 (应为 {current_loan_status_name}) 或模具不匹配。请刷新页面。")
+                conn.rollback()
+                return False
+
+            # Verify current mold status
+            cursor.execute("SELECT current_status_id FROM molds WHERE mold_id = %s", (mold_id,))
+            mold_data = cursor.fetchone()
+            if not mold_data or mold_data[0] != current_mold_status_id:
+                st.warning(f"操作失败：模具状态 (应为 {current_mold_status_name}) 不正确。请刷新页面。")
+                conn.rollback()
+                return False
+                
+            # Update loan application
+            update_loan_q = "UPDATE mold_loan_records SET loan_status_id = %s"
+            params_loan = [target_loan_status_id]
+            
+            now_timestamp = datetime.now()
+            if loan_timestamp_field:
+                update_loan_q += f", {loan_timestamp_field} = %s"
+                params_loan.append(now_timestamp)
+            if loan_operator_field:
+                update_loan_q += f", {loan_operator_field} = %s"
+                params_loan.append(operator_user_id)
+            if remarks_field and remarks_value is not None:
+                update_loan_q += f", {remarks_field} = %s"
+                params_loan.append(remarks_value)
+            
+            update_loan_q += " WHERE loan_id = %s AND loan_status_id = %s"
+            params_loan.extend([loan_id, current_loan_status_id])
+            
+            cursor.execute(update_loan_q, tuple(params_loan))
+            if cursor.rowcount == 0:
+                st.warning("操作失败：申请记录更新失败，可能已被并发修改。")
+                conn.rollback()
+                return False
+
+            # Update mold status
+            update_mold_q = """
+                UPDATE molds SET current_status_id = %s, updated_at = %s
+                WHERE mold_id = %s AND current_status_id = %s
+            """
+            cursor.execute(update_mold_q, (target_mold_status_id, now_timestamp, mold_id, current_mold_status_id))
+            if cursor.rowcount == 0:
+                st.error("严重错误：模具状态更新失败，但申请已更新！请联系管理员检查数据一致性。")
+                conn.rollback()
+                return False
+
+            conn.commit()
+            st.success(f"操作成功：申请 {loan_id} 状态已更新为 {target_loan_status_name}。")
+            return True
+
+    except Exception as e:
+        logging.error(f"Error during status update for loan {loan_id}: {e}", exc_info=True)
+        st.error(f"操作失败：{e}")
+        return False
+
+def approve_loan_application(loan_id, mold_id, approver_user_id, approval_remarks=""):
+    return _update_loan_and_mold_status(
+        loan_id, mold_id,
+        current_loan_status_name="待审批", target_loan_status_name="已批准",
+        current_mold_status_name="闲置", target_mold_status_name="已借出",
+        operator_user_id=approver_user_id,
+        loan_timestamp_field="approval_timestamp",
+        loan_operator_field="approver_id"
+    )
+
+def reject_loan_application(loan_id, mold_id, approver_user_id, rejection_remarks):
+    if not rejection_remarks or not rejection_remarks.strip():
+        st.error("驳回操作必须填写驳回理由。")
+        return False
+    return _update_loan_and_mold_status(
+        loan_id, mold_id,
+        current_loan_status_name="待审批", target_loan_status_name="已驳回",
+        current_mold_status_name="闲置", target_mold_status_name="闲置",
+        operator_user_id=approver_user_id,
+        loan_timestamp_field="approval_timestamp",
+        loan_operator_field="approver_id",
+        remarks_field="remarks", remarks_value=rejection_remarks
+    )
+
+def mark_as_loaned_out(loan_id, mold_id, operator_user_id):
+    return _update_loan_and_mold_status(
+        loan_id, mold_id,
+        current_loan_status_name="已批准", target_loan_status_name="已借出",
+        current_mold_status_name="已借出", target_mold_status_name="已借出",
+        operator_user_id=operator_user_id,
+        loan_timestamp_field="loan_out_timestamp"
+    )
+
+def mark_as_returned(loan_id, mold_id, operator_user_id, return_remarks=""):
+    return _update_loan_and_mold_status(
+        loan_id, mold_id,
+        current_loan_status_name="已借出", target_loan_status_name="已归还",
+        current_mold_status_name="已借出", target_mold_status_name="闲置",
+        operator_user_id=operator_user_id,
+        loan_timestamp_field="actual_return_timestamp"
+    )
+
+# --- Main page function ---
+def show():
+    """Main function to show loan management page"""
+    st.title("🛠️ 模具借用管理")
+    
+    # Check user permissions
+    user_role = st.session_state.get('user_role', '')
+    if user_role not in ['超级管理员', '模具库管理员', '冲压操作工']:
+        st.warning("您没有权限访问此功能")
+        return
+    
+    # Page selection
+    if user_role == '冲压操作工':
+        # Operators can only create applications and view their own
+        page_options = {
+            "新建借用申请": create_loan_application,
+            "查看我的申请": view_loan_applications
+        }
+    else:
+        # Admins can manage all applications
+        page_options = {
+            "查看与管理申请": view_loan_applications,
+            "新建借用申请": create_loan_application
+        }
+    
+    # Use tabs for page navigation
+    if len(page_options) > 1:
+        tabs = st.tabs(list(page_options.keys()))
+        for i, (page_name, page_func) in enumerate(page_options.items()):
+            with tabs[i]:
+                page_func()
+    else:
+        # Single page
+        list(page_options.values())[0]()

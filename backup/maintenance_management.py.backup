@@ -1,0 +1,473 @@
+# pages/maintenance_management.py - 修复版本
+import streamlit as st
+import pandas as pd
+import numpy as np
+import logging
+from datetime import datetime, timedelta, date
+from utils.database import (
+    execute_query, 
+    get_db_connection,
+    convert_numpy_types 
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Helper Functions ---
+
+def safe_int(value, default=0):
+    """安全地转换值为整数，处理None值"""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+def safe_float(value, default=0.0):
+    """安全地转换值为浮点数，处理None值"""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+def get_maintenance_types():
+    """获取维修保养类型列表"""
+    query = "SELECT type_id, type_name, is_repair, description FROM maintenance_types ORDER BY is_repair DESC, type_name"
+    try:
+        return execute_query(query, fetch_all=True)
+    except Exception as e:
+        st.error(f"获取维修保养类型失败: {e}")
+        return []
+
+def get_maintenance_result_statuses():
+    """获取维修保养结果状态列表"""
+    query = "SELECT status_id, status_name, description FROM maintenance_result_statuses ORDER BY status_name"
+    try:
+        return execute_query(query, fetch_all=True)
+    except Exception as e:
+        st.error(f"获取维修结果状态失败: {e}")
+        return []
+
+def get_molds_needing_maintenance():
+    """获取需要维修保养的模具列表 - 修复版本"""
+    query = """
+    SELECT 
+        m.mold_id,
+        m.mold_code,
+        m.mold_name,
+        COALESCE(mft.type_name, '未知类型') as functional_type,
+        COALESCE(ms.status_name, '未知状态') as current_status,
+        COALESCE(sl.location_name, '未知位置') as current_location,
+        COALESCE(m.theoretical_lifespan_strokes, 0) as theoretical_lifespan_strokes,
+        COALESCE(m.accumulated_strokes, 0) as accumulated_strokes,
+        COALESCE(m.maintenance_cycle_strokes, 0) as maintenance_cycle_strokes,
+        CASE 
+            WHEN COALESCE(m.maintenance_cycle_strokes, 0) > 0 AND COALESCE(m.accumulated_strokes, 0) > 0 THEN
+                FLOOR(COALESCE(m.accumulated_strokes, 0)::FLOAT / COALESCE(m.maintenance_cycle_strokes, 1)) + 1
+            ELSE 1
+        END as next_maintenance_cycle,
+        CASE 
+            WHEN COALESCE(m.maintenance_cycle_strokes, 0) > 0 AND COALESCE(m.accumulated_strokes, 0) > 0 THEN
+                ((FLOOR(COALESCE(m.accumulated_strokes, 0)::FLOAT / COALESCE(m.maintenance_cycle_strokes, 1)) + 1) * COALESCE(m.maintenance_cycle_strokes, 0)) - COALESCE(m.accumulated_strokes, 0)
+            ELSE NULL
+        END as strokes_to_next_maintenance,
+        -- 获取最后一次维修保养时间
+        (SELECT MAX(maintenance_start_timestamp) 
+         FROM mold_maintenance_logs 
+         WHERE mold_id = m.mold_id) as last_maintenance_date
+    FROM molds m
+    LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
+    LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+    LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+    WHERE m.current_status_id IN (
+        SELECT status_id FROM mold_statuses 
+        WHERE status_name IN ('待维修', '待保养', '维修中', '保养中', '闲置')
+    )
+    ORDER BY 
+        CASE 
+            WHEN COALESCE(ms.status_name, '') IN ('待维修', '待保养') THEN 1
+            WHEN COALESCE(ms.status_name, '') IN ('维修中', '保养中') THEN 2
+            WHEN COALESCE(m.maintenance_cycle_strokes, 0) > 0 AND COALESCE(m.accumulated_strokes, 0) >= COALESCE(m.maintenance_cycle_strokes, 0) THEN 3
+            ELSE 4
+        END,
+        m.mold_code
+    """
+    try:
+        results = execute_query(query, fetch_all=True)
+        
+        # 后处理数据，确保所有数值都是安全的
+        processed_results = []
+        for result in results:
+            if isinstance(result, dict):
+                processed_result = {}
+                for key, value in result.items():
+                    if key in ['theoretical_lifespan_strokes', 'accumulated_strokes', 'maintenance_cycle_strokes', 'next_maintenance_cycle']:
+                        processed_result[key] = safe_int(value)
+                    elif key == 'strokes_to_next_maintenance':
+                        processed_result[key] = safe_int(value) if value is not None else None
+                    else:
+                        processed_result[key] = value
+                processed_results.append(processed_result)
+            else:
+                processed_results.append(result)
+        
+        return processed_results
+    except Exception as e:
+        st.error(f"获取需要维修保养的模具失败: {e}")
+        logging.error(f"Error in get_molds_needing_maintenance: {e}", exc_info=True)
+        return []
+
+def search_molds_for_maintenance(search_keyword=""):
+    """搜索模具用于维修保养"""
+    query = """
+    SELECT 
+        m.mold_id,
+        m.mold_code,
+        m.mold_name,
+        COALESCE(mft.type_name, '未知类型') as functional_type,
+        COALESCE(ms.status_name, '未知状态') as current_status,
+        COALESCE(sl.location_name, '未知位置') as current_location,
+        COALESCE(m.theoretical_lifespan_strokes, 0) as theoretical_lifespan_strokes,
+        COALESCE(m.accumulated_strokes, 0) as accumulated_strokes,
+        COALESCE(m.maintenance_cycle_strokes, 0) as maintenance_cycle_strokes
+    FROM molds m
+    LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
+    LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+    LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+    WHERE 1=1
+    """
+    
+    params = []
+    if search_keyword.strip():
+        query += " AND (m.mold_code ILIKE %s OR m.mold_name ILIKE %s OR COALESCE(mft.type_name, '') ILIKE %s)"
+        keyword_param = f"%{search_keyword.strip()}%"
+        params.extend([keyword_param, keyword_param, keyword_param])
+    
+    query += " ORDER BY m.mold_code LIMIT 50"
+    
+    try:
+        results = execute_query(query, params=tuple(params), fetch_all=True)
+        
+        # 安全处理结果
+        processed_results = []
+        for result in results:
+            if isinstance(result, dict):
+                processed_result = {}
+                for key, value in result.items():
+                    if key in ['theoretical_lifespan_strokes', 'accumulated_strokes', 'maintenance_cycle_strokes']:
+                        processed_result[key] = safe_int(value)
+                    else:
+                        processed_result[key] = value
+                processed_results.append(processed_result)
+            else:
+                processed_results.append(result)
+        
+        return processed_results
+    except Exception as e:
+        st.error(f"搜索模具失败: {e}")
+        return []
+
+def get_mold_parts(mold_id):
+    """获取模具部件列表"""
+    query = """
+    SELECT 
+        mp.part_id,
+        COALESCE(mp.part_code, '') as part_code,
+        COALESCE(mp.part_name, '未命名部件') as part_name,
+        COALESCE(mpc.category_name, '未分类') as category_name,
+        COALESCE(mp.material, '') as material,
+        COALESCE(mp.lifespan_strokes, 0) as lifespan_strokes,
+        COALESCE(ms.status_name, '未知状态') as current_status
+    FROM mold_parts mp
+    LEFT JOIN mold_part_categories mpc ON mp.part_category_id = mpc.category_id
+    LEFT JOIN mold_statuses ms ON mp.current_status_id = ms.status_id
+    WHERE mp.mold_id = %s
+    ORDER BY mpc.category_name, mp.part_name
+    """
+    try:
+        return execute_query(query, params=(mold_id,), fetch_all=True)
+    except Exception as e:
+        st.error(f"获取模具部件失败: {e}")
+        return []
+
+# --- Main Functions ---
+
+def show_maintenance_dashboard():
+    """显示维修保养仪表板 - 修复版本"""
+    st.subheader("📊 维修保养概览")
+    
+    # 获取统计数据
+    try:
+        # 待维修保养的模具数量
+        pending_maintenance_query = """
+        SELECT 
+            COALESCE(ms.status_name, '未知状态') as status_name,
+            COUNT(*) as count
+        FROM molds m
+        LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+        WHERE COALESCE(ms.status_name, '') IN ('待维修', '待保养', '维修中', '保养中')
+        GROUP BY ms.status_name
+        ORDER BY count DESC
+        """
+        pending_stats = execute_query(pending_maintenance_query, fetch_all=True)
+        
+        # 近期维修记录统计
+        recent_maintenance_query = """
+        SELECT 
+            COALESCE(mt.type_name, '未知类型') as type_name,
+            COUNT(*) as count,
+            AVG(
+                CASE 
+                    WHEN mml.maintenance_end_timestamp IS NOT NULL AND mml.maintenance_start_timestamp IS NOT NULL THEN
+                        EXTRACT(EPOCH FROM (mml.maintenance_end_timestamp - mml.maintenance_start_timestamp))/3600
+                    ELSE NULL
+                END
+            ) as avg_hours
+        FROM mold_maintenance_logs mml
+        LEFT JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
+        WHERE mml.maintenance_start_timestamp >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY mt.type_name
+        ORDER BY count DESC
+        """
+        recent_stats = execute_query(recent_maintenance_query, fetch_all=True)
+        
+        # 显示统计卡片
+        col1, col2, col3, col4 = st.columns(4)
+        
+        # 计算各状态数量，安全处理
+        pending_counts = {}
+        if pending_stats:
+            for stat in pending_stats:
+                status_name = stat.get('status_name', '未知')
+                count = safe_int(stat.get('count', 0))
+                pending_counts[status_name] = count
+        
+        with col1:
+            st.metric(
+                "待维修", 
+                pending_counts.get('待维修', 0),
+                help="需要立即维修的模具数量"
+            )
+        
+        with col2:
+            st.metric(
+                "待保养", 
+                pending_counts.get('待保养', 0),
+                help="需要保养的模具数量"
+            )
+        
+        with col3:
+            st.metric(
+                "维修中", 
+                pending_counts.get('维修中', 0),
+                help="正在维修的模具数量"
+            )
+        
+        with col4:
+            st.metric(
+                "保养中", 
+                pending_counts.get('保养中', 0),
+                help="正在保养的模具数量"
+            )
+        
+        # 显示需要关注的模具
+        st.markdown("---")
+        st.subheader("⚠️ 需要关注的模具")
+        
+        maintenance_needed = get_molds_needing_maintenance()
+        if maintenance_needed:
+            # 按优先级分组显示，安全处理数据
+            urgent_molds = []
+            in_progress_molds = []
+            preventive_molds = []
+            
+            for m in maintenance_needed:
+                current_status = m.get('current_status', '')
+                maintenance_cycle = safe_int(m.get('maintenance_cycle_strokes', 0))
+                strokes_to_next = m.get('strokes_to_next_maintenance')
+                
+                if current_status in ['待维修', '待保养']:
+                    urgent_molds.append(m)
+                elif current_status in ['维修中', '保养中']:
+                    in_progress_molds.append(m)
+                elif (current_status == '闲置' and 
+                      maintenance_cycle > 0 and 
+                      strokes_to_next is not None and 
+                      safe_int(strokes_to_next) <= 1000):
+                    preventive_molds.append(m)
+            
+            if urgent_molds:
+                st.markdown("#### 🚨 紧急需要处理")
+                for mold in urgent_molds[:5]:  # 显示前5个
+                    with st.container():
+                        col1, col2, col3 = st.columns([2, 1, 1])
+                        with col1:
+                            st.write(f"**{mold.get('mold_code', 'N/A')}** - {mold.get('mold_name', 'N/A')}")
+                            st.write(f"状态: {mold.get('current_status', 'N/A')} | 位置: {mold.get('current_location', 'N/A')}")
+                        with col2:
+                            theoretical = safe_int(mold.get('theoretical_lifespan_strokes', 0))
+                            accumulated = safe_int(mold.get('accumulated_strokes', 0))
+                            
+                            if theoretical > 0:
+                                usage_rate = (accumulated / theoretical) * 100
+                                st.write(f"使用率: {usage_rate:.1f}%")
+                            else:
+                                st.write("使用率: N/A")
+                        with col3:
+                            if st.button(f"🔧 立即处理", key=f"urgent_{mold.get('mold_id')}", type="primary"):
+                                st.session_state.maintenance_mold_id = mold.get('mold_id')
+                                st.session_state.active_maintenance_tab = "create"
+                                st.rerun()
+            
+            if preventive_molds:
+                st.markdown("#### ⏰ 预防性保养提醒")
+                for mold in preventive_molds[:3]:  # 显示前3个
+                    with st.container():
+                        col1, col2, col3 = st.columns([2, 1, 1])
+                        with col1:
+                            st.write(f"**{mold.get('mold_code', 'N/A')}** - {mold.get('mold_name', 'N/A')}")
+                        with col2:
+                            remaining = safe_int(mold.get('strokes_to_next_maintenance', 0))
+                            st.write(f"距离保养: {remaining:,} 冲次")
+                        with col3:
+                            if st.button(f"📅 安排保养", key=f"preventive_{mold.get('mold_id')}"):
+                                st.session_state.maintenance_mold_id = mold.get('mold_id')
+                                st.session_state.active_maintenance_tab = "create"
+                                st.rerun()
+        else:
+            st.info("✅ 当前没有需要特别关注的模具")
+        
+        # 近期维修统计图表
+        if recent_stats:
+            st.markdown("---")
+            st.subheader("📈 近30天维修保养统计")
+            
+            # 安全处理统计数据
+            chart_data = []
+            for stat in recent_stats:
+                type_name = stat.get('type_name', '未知类型')
+                count = safe_int(stat.get('count', 0))
+                avg_hours = safe_float(stat.get('avg_hours'))
+                
+                chart_data.append({
+                    'type_name': type_name,
+                    'count': count,
+                    'avg_hours': avg_hours if avg_hours > 0 else None
+                })
+            
+            if chart_data:
+                df_stats = pd.DataFrame(chart_data)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.bar_chart(
+                        df_stats.set_index('type_name')['count'],
+                        height=300
+                    )
+                    st.caption("各类型维修保养次数")
+                
+                with col2:
+                    # 显示平均耗时
+                    avg_hours_data = df_stats[df_stats['avg_hours'].notna()]
+                    if not avg_hours_data.empty:
+                        st.bar_chart(
+                            avg_hours_data.set_index('type_name')['avg_hours'],
+                            height=300
+                        )
+                        st.caption("平均维修保养时长（小时）")
+                    else:
+                        st.info("暂无有效的时长数据")
+        
+    except Exception as e:
+        st.error(f"加载维修保养概览失败: {e}")
+        logging.error(f"Error in show_maintenance_dashboard: {e}", exc_info=True)
+
+# 继续包含其他函数...
+def create_maintenance_record():
+    """创建维修保养记录"""
+    st.subheader("📝 新建维修保养记录")
+    st.info("此功能开发中，请稍后使用...")
+
+def view_maintenance_records():
+    """查看维修保养记录"""
+    st.subheader("📋 维修保养记录")
+    st.info("此功能开发中，请稍后使用...")
+
+def show_maintenance_statistics():
+    """显示维修保养统计分析"""
+    st.subheader("📊 维修保养统计分析")
+    st.info("此功能开发中，请稍后使用...")
+
+# --- Main page function ---
+def show():
+    """Main function to show maintenance management page"""
+    st.title("🔧 模具维修保养管理")
+    
+    # Check user permissions
+    user_role = st.session_state.get('user_role', '')
+    if user_role not in ['超级管理员', '模具库管理员', '模具工']:
+        st.warning("您没有权限访问此功能")
+        return
+    
+    # 使用说明
+    with st.expander("💡 使用说明", expanded=False):
+        st.markdown("""
+        ### 🔧 维修保养管理功能说明
+        
+        **1. 维修保养概览**
+        - 查看当前需要维修保养的模具统计
+        - 显示紧急需要处理的模具
+        - 提供预防性保养提醒
+        
+        **2. 新建维修保养记录**
+        - 搜索选择需要维修保养的模具
+        - 支持整体模具或特定部件的维修记录
+        - 记录详细的维修过程和结果
+        
+        **3. 查看维修记录**
+        - 按类型、状态、时间等条件筛选记录
+        - 查看详细的维修保养历史
+        - 跟踪维修进度和结果
+        
+        **4. 统计分析**
+        - 分析维修保养频率和成本
+        - 识别高维修频率的模具
+        - 查看维修保养趋势
+        """)
+    
+    # 根据用户角色显示不同的标签页
+    if user_role == '模具工':
+        # 模具工主要关注维修记录的创建和查看
+        tab1, tab2, tab3 = st.tabs(["📊 维修概览", "📝 新建记录", "📋 我的记录"])
+        
+        with tab1:
+            show_maintenance_dashboard()
+        
+        with tab2:
+            create_maintenance_record()
+        
+        with tab3:
+            view_maintenance_records()
+    else:
+        # 管理员可以看到全部功能
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 维修概览", "📝 新建记录", "📋 查看记录", "📈 统计分析"])
+        
+        with tab1:
+            show_maintenance_dashboard()
+        
+        with tab2:
+            create_maintenance_record()
+        
+        with tab3:
+            view_maintenance_records()
+        
+        with tab4:
+            show_maintenance_statistics()
+    
+    # 检查是否从其他页面跳转到特定标签
+    active_tab = st.session_state.get('active_maintenance_tab')
+    if active_tab == "create":
+        st.session_state.active_maintenance_tab = None
