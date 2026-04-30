@@ -1,0 +1,22 @@
+# Web UI
+streamlit>=1.32,<2
+
+# Data
+pandas>=2.0,<3
+numpy>=1.24,<3
+
+# Charts
+plotly>=5.18,<6
+
+# Auth
+bcrypt>=4,<5
+
+# System / Ops
+psutil>=5.9,<6
+
+# Schema docs / migrations (历史遗留仍会 import)
+SQLAlchemy>=2,<3
+alembic>=1.12,<2
+
+# Tests
+pytest>=8,<9
