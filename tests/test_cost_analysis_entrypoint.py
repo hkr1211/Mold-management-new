@@ -71,10 +71,16 @@ def _load_page(st_mock, has_perm=lambda perm: True):
 
     import numpy as np
     import pandas as pd
-    import plotly.graph_objects as go
-    import plotly.express as px
     sys.modules["numpy"] = np
     sys.modules["pandas"] = pd
+
+    # 清除其它测试可能残留的 plotly mock 占位，强制真实导入
+    for _m in ("plotly.graph_objects", "plotly.express", "plotly"):
+        _mod = sys.modules.get(_m)
+        if _mod is not None and not getattr(_mod, "__file__", None):
+            del sys.modules[_m]
+    import plotly.graph_objects as go
+    import plotly.express as px
     sys.modules["plotly.graph_objects"] = go
     sys.modules["plotly.express"] = px
 
