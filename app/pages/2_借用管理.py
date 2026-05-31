@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import logging
+import sqlite3
 from datetime import datetime, timedelta, date
 from utils.database import (
     execute_query, 
@@ -84,7 +85,7 @@ def get_status_id_by_name(status_name, table_name="loan_statuses", name_column="
             logging.error(f"Status '{status_name}' not found in table '{table_name}'.")
             st.error(f"系统错误：无法找到状态 '{status_name}'。请联系管理员。")
             return None
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Error fetching status ID for '{status_name}' from '{table_name}': {e}")
         st.error(f"数据库错误：获取状态ID失败。详情：{e}")
         return None
@@ -127,7 +128,7 @@ def search_available_molds(search_keyword=""):
     try:
         results = execute_query(base_query, params=tuple(params), fetch_all=True)
         return results if results else []
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Error searching available molds: {e}")
         st.error(f"搜索可用模具时出错: {e}")
         return []
@@ -153,7 +154,7 @@ def get_mold_details(mold_id):
     try:
         result = execute_query(query, params=(mold_id,), fetch_all=True)
         return result[0] if result else None
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取模具详情失败: {e}")
         return None
 
@@ -421,7 +422,7 @@ def submit_loan_application(mold_id, applicant_id, expected_return_date, destina
             # 提示后续流程
             st.info("📋 申请已提交，请等待模具库管理员审批。您可以在'查看与管理申请'页面查看申请状态。")
 
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Loan application submission failed: {e}", exc_info=True)
         st.error(f"提交申请失败：{e}")
 
@@ -460,7 +461,7 @@ def view_loan_applications():
             status_name = status['status_name'] if isinstance(status, dict) else status[1]
             status_filter_options[status_id] = status_name
         
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取状态列表失败：{e}")
         return
     
@@ -580,7 +581,7 @@ def view_loan_applications():
                             if mark_as_returned(app_id, mold_id, current_user_id):
                                 st.rerun()
 
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Failed to load loan applications: {e}")
         st.error(f"加载借用申请列表失败：{e}")
         st.exception(e)  # 显示详细错误用于调试
@@ -658,7 +659,7 @@ def _update_loan_and_mold_status(loan_id, mold_id,
             st.success(f"操作成功：申请状态已更新为 {target_loan_status_name}。")
             return True
 
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Error during status update for loan {loan_id}: {e}", exc_info=True)
         st.error(f"操作失败：{e}")
         return False
