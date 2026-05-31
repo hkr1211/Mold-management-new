@@ -1,5 +1,11 @@
 -- sql/sqlite_init.sql — SQLite 数据库初始化（建表 + 基础数据）
 -- 所有 CREATE TABLE 使用 IF NOT EXISTS，幂等安全。
+--
+-- ⚠️ 本文件是数据库 schema 的【唯一事实来源】(single source of truth)。
+--    运行时由 app/utils/database.py::initialize_database() 执行。
+--    历史的 PostgreSQL Alembic 迁移已于 2026-05-31 移除。
+--    app/utils/models.py 仅为人类可读的 schema 文档，非权威、非运行时依赖；
+--    任何表结构变更都应先改本文件。
 
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -159,6 +165,14 @@ CREATE TABLE IF NOT EXISTS system_logs (
 );
 CREATE INDEX IF NOT EXISTS ix_system_logs_user_id   ON system_logs(user_id);
 CREATE INDEX IF NOT EXISTS ix_system_logs_timestamp ON system_logs(timestamp);
+
+-- ── 登录失败计数 / 账号锁定（服务端，防止清会话绕过）────────────────
+CREATE TABLE IF NOT EXISTS login_attempts (
+    username     TEXT    PRIMARY KEY,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_attempt TEXT,
+    locked_until TEXT
+);
 
 -- ── 生产设备 ──────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS production_equipment (

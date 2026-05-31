@@ -325,6 +325,13 @@ def _assert_safe_identifier(name: str, kind: str = 'identifier') -> None:
     if kind == 'table' and name not in _ALLOWED_TABLES:
         raise ValueError(f"表名不在白名单中：{name!r}")
 
+def _get_primary_key(table: str) -> Optional[str]:
+    """通过 PRAGMA table_info 读取表的真实主键列名（不靠命名约定猜测）。"""
+    for col in get_table_info(table):
+        if col.get('pk'):
+            return col['name']
+    return None
+
 # ── 数据验证函数 ─────────────────────────────────────────────────────
 def validate_foreign_key(table: str, column: str, value: Any) -> bool:
     try:
@@ -351,7 +358,11 @@ def validate_unique_constraint(table: str, column: str, value: Any,
         params: list = [value]
 
         if exclude_id is not None:
-            primary_key = f"{table.rstrip('s')}_id"
+            primary_key = _get_primary_key(table)
+            if not primary_key:
+                logger.error(f"无法确定表 {table} 的主键，跳过 exclude_id 过滤")
+                raise ValueError(f"表 {table} 无主键，无法按 exclude_id 排除")
+            _assert_safe_identifier(primary_key, 'column')
             query += f" AND {primary_key} != %s"
             params.append(exclude_id)
 

@@ -7,7 +7,6 @@ from utils.database import execute_query
 import logging
 import json
 import re
-import time
 from datetime import datetime, timedelta
 
 try:
@@ -112,34 +111,81 @@ def has_permission(permission: str) -> bool:
     
     return permission in permissions
 
-def login_user(username: str, password: str):
-    """用户登录 - 加尝试限制"""
-    if 'login_attempts' not in st.session_state:
-        st.session_state['login_attempts'] = 0
-        st.session_state['last_attempt_time'] = time.time()
+_LOCK_TIME_FMT = '%Y-%m-%d %H:%M:%S'
 
-    # 检查锁定
-    if st.session_state['login_attempts'] >= LOGIN_MAX_ATTEMPTS:
-        if time.time() - st.session_state['last_attempt_time'] < LOGIN_LOCKOUT_SECONDS:
-            logger.warning(f"登录尝试过多，锁定: {username}")
-            return None
-        else:
-            # 超时重置
-            st.session_state['login_attempts'] = 0
+def _get_lockout_record(username: str):
+    """读取某用户名的失败计数/锁定记录。"""
+    try:
+        return execute_query(
+            "SELECT attempts, locked_until FROM login_attempts WHERE username = %s",
+            params=(username,), fetch_one=True
+        )
+    except Exception as e:
+        logger.error(f"读取登录锁定记录失败: {e}")
+        return None
+
+def _is_locked(record) -> bool:
+    """根据记录判断账号是否仍在锁定时段内。"""
+    if not record or not record.get('locked_until'):
+        return False
+    try:
+        locked_until = datetime.strptime(record['locked_until'], _LOCK_TIME_FMT)
+    except (ValueError, TypeError):
+        return False
+    return datetime.now() < locked_until
+
+def _register_failed_attempt(username: str) -> None:
+    """登录失败：服务端累加计数，达阈值则写入锁定截止时间。"""
+    record = _get_lockout_record(username)
+    attempts = (record['attempts'] if record else 0) + 1
+    locked_until = None
+    if attempts >= LOGIN_MAX_ATTEMPTS:
+        locked_until = (datetime.now() + timedelta(seconds=LOGIN_LOCKOUT_SECONDS)).strftime(_LOCK_TIME_FMT)
+    now = datetime.now().strftime(_LOCK_TIME_FMT)
+    try:
+        execute_query(
+            """
+            INSERT INTO login_attempts (username, attempts, last_attempt, locked_until)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT(username) DO UPDATE SET
+                attempts     = excluded.attempts,
+                last_attempt = excluded.last_attempt,
+                locked_until = excluded.locked_until
+            """,
+            params=(username, attempts, now, locked_until), commit=True
+        )
+    except Exception as e:
+        logger.error(f"写入登录失败计数失败: {e}")
+
+def _reset_attempts(username: str) -> None:
+    """登录成功：清除该用户名的失败计数。"""
+    try:
+        execute_query(
+            "DELETE FROM login_attempts WHERE username = %s",
+            params=(username,), commit=True
+        )
+    except Exception as e:
+        logger.error(f"清除登录失败计数失败: {e}")
+
+def login_user(username: str, password: str):
+    """用户登录 - 服务端失败计数与锁定（基于 DB，清除会话无法绕过）"""
+    # 服务端锁定检查
+    if _is_locked(_get_lockout_record(username)):
+        logger.warning(f"账号锁定中，拒绝登录: {username}")
+        return None
 
     user_info = check_password(username, password)
 
     if user_info:
         logger.info(f"登录成功: {username}")
+        # 重置失败计数
+        _reset_attempts(username)
         # 设置会话
         st.session_state['logged_in'] = True
         st.session_state['user_id'] = user_info['user_id']
         st.session_state['username'] = user_info['username']
         st.session_state['full_name'] = user_info.get('full_name', user_info['username'])
         st.session_state['user_role'] = user_info['role']
-
-        # 重置尝试
-        st.session_state['login_attempts'] = 0
 
         # 记录日志
         try:
@@ -149,9 +195,8 @@ def login_user(username: str, password: str):
 
         return user_info
     else:
-        st.session_state['login_attempts'] += 1
-        st.session_state['last_attempt_time'] = time.time()
-        logger.warning(f"登录失败: {username}，尝试次数: {st.session_state['login_attempts']}")
+        _register_failed_attempt(username)
+        logger.warning(f"登录失败: {username}")
         return None
 
 def logout_user():

@@ -1,7 +1,9 @@
 # app/utils/models.py
 #
-# SQLAlchemy ORM 模型 — 仅作为数据库 schema 文档和 Alembic 迁移辅助。
-# 实际查询全部通过 utils/database.py 的原生 SQL 执行，不依赖此文件。
+# SQLAlchemy ORM 模型 — 仅作为人类可读的 schema 文档。
+# ⚠️ 非权威、非运行时依赖：schema 的唯一事实来源是 sql/sqlite_init.sql。
+#     实际查询全部通过 utils/database.py 的原生 SQL 执行，不依赖此文件。
+#     （注意 sqlalchemy 未列入 requirements.txt，本文件在部署环境无法 import。）
 
 import datetime
 from sqlalchemy import (
