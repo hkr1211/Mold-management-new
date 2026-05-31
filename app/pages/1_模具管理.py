@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import logging
+import sqlite3
 from datetime import date
 from utils.database import (
     execute_query, get_all_molds, get_mold_statuses,
@@ -13,6 +14,17 @@ from utils.nav import setup_sidebar
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _load_or_stop(fn, *args, **kwargs):
+    """执行数据读取：DB 故障时提示“加载失败”并停止本次渲染（区别于“暂无数据”）；
+    编码缺陷（非 sqlite3.Error）照常上抛暴露。"""
+    try:
+        return fn(*args, **kwargs)
+    except sqlite3.Error as e:
+        logger.error(f"数据加载失败: {e}")
+        st.error(f"❌ 数据加载失败：{e}")
+        st.stop()
 
 inject_global_css()
 
@@ -31,44 +43,42 @@ page_header("🛠️", "模具管理", "模具台账 · 新增 · 编辑")
 # --- 数据加载 ---
 @st.cache_data(ttl=300)
 def load_molds(search_code="", search_name="", status_filter="全部"):
-    try:
-        query = """
-        SELECT
-            m.mold_id,
-            m.mold_code        AS 模具编号,
-            m.mold_name        AS 模具名称,
-            mft.type_name      AS 功能类型,
-            ms.status_name     AS 当前状态,
-            sl.location_name   AS 存放位置,
-            m.accumulated_strokes         AS 累计模次,
-            m.theoretical_lifespan_strokes AS 理论寿命,
-            m.maintenance_cycle_strokes    AS 保养周期,
-            u.full_name        AS 负责人,
-            m.supplier         AS 供应商,
-            m.remarks          AS 备注,
-            m.created_at       AS 创建时间
-        FROM molds m
-        LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
-        LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
-        LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
-        LEFT JOIN users u ON m.responsible_person_id = u.user_id
-        ORDER BY m.created_at DESC
-        """
-        rows = execute_query(query, fetch_all=True) or []
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-
-        if search_code:
-            df = df[df['模具编号'].str.contains(search_code, case=False, na=False)]
-        if search_name:
-            df = df[df['模具名称'].str.contains(search_name, case=False, na=False)]
-        if status_filter != "全部":
-            df = df[df['当前状态'] == status_filter]
+    # 不再吞异常：DB 故障与编码缺陷一律上抛，由调用方（_load_or_stop）区分
+    # 展示“加载失败”与“暂无数据”。
+    query = """
+    SELECT
+        m.mold_id,
+        m.mold_code        AS 模具编号,
+        m.mold_name        AS 模具名称,
+        mft.type_name      AS 功能类型,
+        ms.status_name     AS 当前状态,
+        sl.location_name   AS 存放位置,
+        m.accumulated_strokes         AS 累计模次,
+        m.theoretical_lifespan_strokes AS 理论寿命,
+        m.maintenance_cycle_strokes    AS 保养周期,
+        u.full_name        AS 负责人,
+        m.supplier         AS 供应商,
+        m.remarks          AS 备注,
+        m.created_at       AS 创建时间
+    FROM molds m
+    LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
+    LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+    LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+    LEFT JOIN users u ON m.responsible_person_id = u.user_id
+    ORDER BY m.created_at DESC
+    """
+    rows = execute_query(query, fetch_all=True) or []
+    df = pd.DataFrame(rows)
+    if df.empty:
         return df
-    except Exception as e:
-        logger.error(f"加载模具列表失败: {e}")
-        return pd.DataFrame()
+
+    if search_code:
+        df = df[df['模具编号'].str.contains(search_code, case=False, na=False)]
+    if search_name:
+        df = df[df['模具名称'].str.contains(search_name, case=False, na=False)]
+    if status_filter != "全部":
+        df = df[df['当前状态'] == status_filter]
+    return df
 
 @st.cache_data(ttl=600)
 def load_lookup_data():
@@ -93,7 +103,7 @@ with tab1:
     with col2:
         search_name = st.text_input("按名称搜索", placeholder="输入模具名称...", key="search_name")
     with col3:
-        statuses, _, _, _ = load_lookup_data()
+        statuses, _, _, _ = _load_or_stop(load_lookup_data)
         status_names = ["全部"] + [s['status_name'] for s in statuses]
         status_filter = st.selectbox("状态筛选", status_names, key="status_filter")
 
@@ -103,7 +113,7 @@ with tab1:
             st.cache_data.clear()
             st.rerun()
 
-    df = load_molds(search_code, search_name, status_filter)
+    df = _load_or_stop(load_molds, search_code, search_name, status_filter)
 
     if df.empty:
         st.info("暂无符合条件的模具记录。")
@@ -137,7 +147,7 @@ with tab2:
     if not has_permission('manage_molds'):
         st.warning("🔒 您的角色没有新增模具的权限。")
     else:
-        statuses, locations, types, users_raw = load_lookup_data()
+        statuses, locations, types, users_raw = _load_or_stop(load_lookup_data)
 
         with st.form("add_mold_form", clear_on_submit=True):
             st.subheader("基本信息")
@@ -184,7 +194,8 @@ with tab2:
                 st.error("❌ 模具名称不能为空")
             else:
                 # 检查编号唯一性
-                exists = execute_query(
+                exists = _load_or_stop(
+                    execute_query,
                     "SELECT mold_id FROM molds WHERE mold_code = %s",
                     params=(mold_code.strip(),), fetch_one=True
                 )
@@ -216,7 +227,7 @@ with tab2:
                         log_user_action('CREATE_MOLD', 'molds', mold_code.strip())
                         st.success(f"✅ 模具 {mold_code} 创建成功！")
                         st.cache_data.clear()
-                    except Exception as e:
+                    except sqlite3.Error as e:
                         logger.error(f"创建模具失败: {e}")
                         st.error(f"❌ 创建失败：{e}")
 
@@ -231,7 +242,8 @@ with tab3:
 
         code_to_edit = st.session_state.get('edit_mold_code', '')
         if code_to_edit:
-            mold_row = execute_query(
+            mold_row = _load_or_stop(
+                execute_query,
                 """
                 SELECT m.*, ms.status_name, sl.location_name, mft.type_name,
                        u.full_name as responsible_name
@@ -248,7 +260,7 @@ with tab3:
             if not mold_row:
                 st.error(f"❌ 未找到模具编号：{code_to_edit}")
             else:
-                statuses, locations, types, users_raw = load_lookup_data()
+                statuses, locations, types, users_raw = _load_or_stop(load_lookup_data)
                 status_options = {s['status_name']: s['status_id'] for s in statuses}
                 location_options = {l['location_name']: l['location_id'] for l in locations}
                 type_options = {t['type_name']: t['type_id'] for t in types}
@@ -321,6 +333,6 @@ with tab3:
                             st.success(f"✅ 模具 {code_to_edit} 更新成功！")
                             st.cache_data.clear()
                             del st.session_state['edit_mold_code']
-                        except Exception as e:
+                        except sqlite3.Error as e:
                             logger.error(f"更新模具失败: {e}")
                             st.error(f"❌ 更新失败：{e}")
