@@ -1269,7 +1269,7 @@ def get_error_logs(level, module, days):
             "模块": "数据库",
             "用户": "mold_admin",
             "错误信息": "数据库连接超时",
-            "堆栈跟踪": "psycopg2.OperationalError: could not connect to server..."
+            "堆栈跟踪": "sqlite3.OperationalError: database is locked..."
         },
         {
             "时间": "2024-06-12 13:15:10",

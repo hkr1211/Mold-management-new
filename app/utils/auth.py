@@ -3,7 +3,7 @@
 import streamlit as st
 import bcrypt
 import functools
-from utils.database import execute_query
+from utils.database import execute_query, check_table_exists
 import logging
 import json
 import re
@@ -223,15 +223,13 @@ def log_user_action(action_type: str, target_resource: str,
     
     try:
         # 检查表存在
-        check_query = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='system_logs'"
-        table_exists = execute_query(check_query, fetch_one=True)
-        if not table_exists:
+        if not check_table_exists('system_logs'):
             logger.warning("system_logs表不存在，跳过日志记录")
             return
-        
+
         # 记录日志
         query = """
-        INSERT INTO system_logs (user_id, action_type, target_resource, 
+        INSERT INTO system_logs (user_id, action_type, target_resource,
                                  target_id, details, timestamp)
         VALUES (%s, %s, %s, %s, %s, NOW())
         """
@@ -342,11 +340,9 @@ def update_user_status(user_id: int, is_active: bool):
 def get_user_activity_log(user_id=None, days=7):
     """获取用户活动日志"""
     try:
-        check_query = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='system_logs'"
-        table_exists = execute_query(check_query, fetch_one=True)
-        if not table_exists:
+        if not check_table_exists('system_logs'):
             return []
-        
+
         cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
         if user_id:
             query = """

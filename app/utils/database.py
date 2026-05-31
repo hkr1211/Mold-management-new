@@ -12,11 +12,15 @@ from datetime import datetime, date
 from decimal import Decimal
 
 try:
-    from config.settings import DB_PATH, CACHE_TTL_SECONDS
+    from config.settings import (
+        DB_PATH, CACHE_TTL_SECONDS, LOOKUP_CACHE_TTL, DEFAULT_PAGE_SIZE
+    )
 except ImportError:
     _default_db = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'mold_management.db')
     DB_PATH = os.getenv('SQLITE_DB_PATH', os.path.abspath(_default_db))
     CACHE_TTL_SECONDS = 300
+    LOOKUP_CACHE_TTL = 600
+    DEFAULT_PAGE_SIZE = 100
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,7 +43,12 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 # ── SQL 方言转换（PostgreSQL → SQLite）──────────────────────────────
+# 匹配单引号字符串字面量（含 '' 转义），用于在做按词替换前保护其内容。
+_STRING_LITERAL_RE = _re.compile(r"'(?:[^']|'')*'")
+_PLACEHOLDER_RE = _re.compile(r'\x00(\d+)\x00')
+
 def _normalize_sql(sql: str) -> str:
+    # 结构性替换：作用于 SQL 语法 token，需要原始字面量（如 DATE_TRUNC 的 'month'），在保护前完成。
     sql = sql.replace('%s', '?')
     sql = _re.sub(r'\bNOW\s*\(\)', "datetime('now')", sql, flags=_re.IGNORECASE)
     sql = _re.sub(r'\bCURRENT_TIMESTAMP\b', "datetime('now')", sql, flags=_re.IGNORECASE)
@@ -48,10 +57,20 @@ def _normalize_sql(sql: str) -> str:
         "date('now','start of month')",
         sql, flags=_re.IGNORECASE
     )
+
+    # 把字符串字面量挖出占位，避免 ILIKE/true/false 的按词替换误伤其中的用户数据。
+    literals: list = []
+    def _stash(m):
+        literals.append(m.group(0))
+        return f"\x00{len(literals) - 1}\x00"
+    sql = _STRING_LITERAL_RE.sub(_stash, sql)
+
     sql = _re.sub(r'\bILIKE\b', 'LIKE', sql, flags=_re.IGNORECASE)
     sql = _re.sub(r'\btrue\b', '1', sql, flags=_re.IGNORECASE)
     sql = _re.sub(r'\bfalse\b', '0', sql, flags=_re.IGNORECASE)
-    return sql
+
+    # 还原被保护的字面量
+    return _PLACEHOLDER_RE.sub(lambda m: literals[int(m.group(1))], sql)
 
 # ── 数据类型转换 ─────────────────────────────────────────────────────
 def convert_numpy_types(obj):
@@ -221,7 +240,7 @@ def check_table_exists(table_name: str) -> bool:
         return False
 
 # ── 专用查询函数 ─────────────────────────────────────────────────────
-def get_all_molds(offset: int = 0, limit: int = 100) -> List[Dict]:
+def get_all_molds(offset: int = 0, limit: int = DEFAULT_PAGE_SIZE) -> List[Dict]:
     try:
         query = """
         SELECT
@@ -434,7 +453,7 @@ def transaction():
         raise
 
 # ── 缓存查找数据 ─────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=LOOKUP_CACHE_TTL)
 def get_cached_lookup_data():
     try:
         return {
