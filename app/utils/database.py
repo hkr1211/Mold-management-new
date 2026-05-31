@@ -22,7 +22,7 @@ except ImportError:
     LOOKUP_CACHE_TTL = 600
     DEFAULT_PAGE_SIZE = 100
 
-logging.basicConfig(level=logging.INFO)
+# 日志：库模块只取 logger，全局配置交给入口 main.py
 logger = logging.getLogger(__name__)
 
 # ── 连接管理（每线程独立连接 + WAL 模式）────────────────────────────

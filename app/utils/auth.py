@@ -16,8 +16,7 @@ try:
 except ImportError:
     LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_SECONDS, PASSWORD_MIN_LENGTH = 5, 300, 8
 
-# 配置日志，与database.py统一
-logging.basicConfig(level=logging.INFO)
+# 日志：库模块只取 logger，全局配置交给入口 main.py
 logger = logging.getLogger(__name__)
 
 # 角色权限映射（保持硬编码，未来可移到DB）

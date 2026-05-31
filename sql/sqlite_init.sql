@@ -3,8 +3,7 @@
 --
 -- ⚠️ 本文件是数据库 schema 的【唯一事实来源】(single source of truth)。
 --    运行时由 app/utils/database.py::initialize_database() 执行。
---    历史的 PostgreSQL Alembic 迁移已于 2026-05-31 移除。
---    app/utils/models.py 仅为人类可读的 schema 文档，非权威、非运行时依赖；
+--    历史的 PostgreSQL Alembic 迁移与 SQLAlchemy 模型 (models.py) 已移除。
 --    任何表结构变更都应先改本文件。
 
 PRAGMA journal_mode=WAL;
