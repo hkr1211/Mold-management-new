@@ -2,11 +2,20 @@
 
 import streamlit as st
 import bcrypt
+import functools
 from utils.database import execute_query
 import logging
 import json
-import re  # 用于密码复杂度验证
-import time  # 用于登录尝试延迟
+import re
+import time
+from datetime import datetime, timedelta
+
+try:
+    from config.settings import (
+        LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_SECONDS, PASSWORD_MIN_LENGTH
+    )
+except ImportError:
+    LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_SECONDS, PASSWORD_MIN_LENGTH = 5, 300, 8
 
 # 配置日志，与database.py统一
 logging.basicConfig(level=logging.INFO)
@@ -108,18 +117,18 @@ def login_user(username: str, password: str):
     if 'login_attempts' not in st.session_state:
         st.session_state['login_attempts'] = 0
         st.session_state['last_attempt_time'] = time.time()
-    
+
     # 检查锁定
-    if st.session_state['login_attempts'] >= 5:
-        if time.time() - st.session_state['last_attempt_time'] < 300:  # 5分钟锁定
+    if st.session_state['login_attempts'] >= LOGIN_MAX_ATTEMPTS:
+        if time.time() - st.session_state['last_attempt_time'] < LOGIN_LOCKOUT_SECONDS:
             logger.warning(f"登录尝试过多，锁定: {username}")
             return None
         else:
             # 超时重置
             st.session_state['login_attempts'] = 0
-    
+
     user_info = check_password(username, password)
-    
+
     if user_info:
         logger.info(f"登录成功: {username}")
         # 设置会话
@@ -128,16 +137,16 @@ def login_user(username: str, password: str):
         st.session_state['username'] = user_info['username']
         st.session_state['full_name'] = user_info.get('full_name', user_info['username'])
         st.session_state['user_role'] = user_info['role']
-        
+
         # 重置尝试
         st.session_state['login_attempts'] = 0
-        
+
         # 记录日志
         try:
             log_user_action('LOGIN', 'system', username)
         except Exception as e:
             logger.error(f"记录登录日志失败: {e}")
-        
+
         return user_info
     else:
         st.session_state['login_attempts'] += 1
@@ -169,15 +178,9 @@ def log_user_action(action_type: str, target_resource: str,
     
     try:
         # 检查表存在
-        check_query = """
-        SELECT EXISTS (
-            SELECT 1 FROM information_schema.tables 
-            WHERE table_name = 'system_logs'
-        )
-        """
-        
+        check_query = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='system_logs'"
         table_exists = execute_query(check_query, fetch_one=True)
-        if not table_exists or not table_exists.get('exists'):
+        if not table_exists:
             logger.warning("system_logs表不存在，跳过日志记录")
             return
         
@@ -236,9 +239,15 @@ def create_user(username: str, password: str, full_name: str,
     if existing:
         return False, "用户名已存在"
     
-    # 获取role_id
-    role_query = "SELECT role_id FROM roles WHERE role_name = %s"
-    role_result = execute_query(role_query, params=(role_name,), fetch_one=True)
+    # 获取 role_id。兼容传入 role_name 或 role_id
+    if isinstance(role_name, int) or (isinstance(role_name, str) and role_name.isdigit()):
+        role_query = "SELECT role_id FROM roles WHERE role_id = %s"
+        role_lookup_value = int(role_name)
+    else:
+        role_query = "SELECT role_id FROM roles WHERE role_name = %s"
+        role_lookup_value = role_name
+
+    role_result = execute_query(role_query, params=(role_lookup_value,), fetch_one=True)
     
     if not role_result:
         return False, f"角色 '{role_name}' 不存在"
@@ -288,37 +297,32 @@ def update_user_status(user_id: int, is_active: bool):
 def get_user_activity_log(user_id=None, days=7):
     """获取用户活动日志"""
     try:
-        check_query = """
-        SELECT EXISTS (
-            SELECT 1 FROM information_schema.tables 
-            WHERE table_name = 'system_logs'
-        )
-        """
-        
+        check_query = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='system_logs'"
         table_exists = execute_query(check_query, fetch_one=True)
-        if not table_exists or not table_exists.get('exists'):
+        if not table_exists:
             return []
         
+        cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
         if user_id:
             query = """
             SELECT sl.*, u.username, u.full_name
             FROM system_logs sl
             JOIN users u ON sl.user_id = u.user_id
-            WHERE sl.user_id = %s AND sl.timestamp >= NOW() - INTERVAL '%s days'
+            WHERE sl.user_id = %s AND sl.timestamp >= %s
             ORDER BY sl.timestamp DESC
             LIMIT 100
             """
-            params = (user_id, days)
+            params = (user_id, cutoff)
         else:
             query = """
             SELECT sl.*, u.username, u.full_name
             FROM system_logs sl
             JOIN users u ON sl.user_id = u.user_id
-            WHERE sl.timestamp >= NOW() - INTERVAL '%s days'
+            WHERE sl.timestamp >= %s
             ORDER BY sl.timestamp DESC
             LIMIT 100
             """
-            params = (days,)
+            params = (cutoff,)
         
         return execute_query(query, params=params, fetch_all=True) or []
     except Exception as e:
@@ -338,8 +342,8 @@ def get_all_roles():
 
 def validate_password_strength(password: str):
     """验证密码强度 - 增强版"""
-    if len(password) < 8:
-        return False, "密码长度至少8位"
+    if len(password) < PASSWORD_MIN_LENGTH:
+        return False, f"密码长度至少{PASSWORD_MIN_LENGTH}位"
     if not re.search(r'[A-Z]', password):
         return False, "密码必须包含大写字母"
     if not re.search(r'[a-z]', password):
@@ -352,3 +356,44 @@ def get_user_permissions():
     """获取当前用户的权限列表"""
     user_role = st.session_state.get('user_role', '')
     return ROLE_PERMISSIONS.get(user_role, [])
+
+def require_permission(permission: str):
+    """页面级权限装饰器，用于保护 show() 函数"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not st.session_state.get('logged_in', False):
+                st.error("🔒 请先登录以访问此页面。")
+                st.stop()
+                return
+            if not has_permission(permission):
+                user_role = st.session_state.get('user_role', '未知角色')
+                st.error(f"❌ 权限不足：您的角色（{user_role}）无法访问此功能。")
+                st.stop()
+                return
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def update_user_password(user_id: int, new_password: str):
+    """更新用户密码"""
+    is_valid, msg = validate_password_strength(new_password)
+    if not is_valid:
+        return False, msg
+
+    password_hash = bcrypt.hashpw(
+        new_password.encode('utf-8'),
+        bcrypt.gensalt()
+    ).decode('utf-8')
+
+    query = "UPDATE users SET password_hash = %s, updated_at = NOW() WHERE user_id = %s"
+    try:
+        rowcount = execute_query(query, params=(password_hash, user_id), commit=True)
+        if rowcount and rowcount > 0:
+            logger.info(f"密码更新成功: user_id={user_id}")
+            return True, "密码更新成功"
+        else:
+            return False, "用户不存在"
+    except Exception as e:
+        logger.error(f"更新密码失败: {e}")
+        return False, f"更新失败: {str(e)}"

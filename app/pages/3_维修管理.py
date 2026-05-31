@@ -15,6 +15,142 @@ from utils.database import (
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+def _format_maintenance_datetime(value, fmt='%Y-%m-%d %H:%M', default='N/A'):
+    """兼容 SQLite 字符串时间与 datetime 对象的显示格式化"""
+    if value is None or (isinstance(value, str) and not value.strip()) or pd.isna(value):
+        return default
+    if hasattr(value, 'strftime'):
+        return value.strftime(fmt)
+    try:
+        return pd.to_datetime(value).strftime(fmt)
+    except Exception:
+        return str(value)
+
+
+def _to_maintenance_datetime(value):
+    if value is None or (isinstance(value, str) and not value.strip()) or pd.isna(value):
+        return None
+    if hasattr(value, 'strftime'):
+        return value
+    try:
+        return pd.to_datetime(value).to_pydatetime()
+    except Exception:
+        return None
+
+
+def _map_legacy_maintenance_field(field_name):
+    """将旧版维修字段映射到当前 SQLite schema"""
+    mapping = {
+        'maintained_by_id': 'technician_id',
+        'maintenance_cost': 'cost',
+        'problem_description': 'description',
+        'actions_taken': 'description',
+        'notes': 'description',
+        'replaced_parts_info': None,
+    }
+    return mapping.get(field_name, field_name)
+
+
+def _build_maintenance_records_query(selected_type_id, selected_status_id, time_range):
+    query = """
+    SELECT
+        mml.log_id,
+        m.mold_code,
+        m.mold_name,
+        mt.type_name as maintenance_type,
+        mt.is_repair,
+        u.full_name as maintained_by,
+        mml.maintenance_start_timestamp,
+        mml.maintenance_end_timestamp,
+        mml.description as problem_description,
+        '' as actions_taken,
+        mml.cost as maintenance_cost,
+        mrs.status_name as result_status,
+        '' as notes,
+        NULL as replaced_parts_info,
+        mml.result_status_id,
+        mml.mold_id
+    FROM mold_maintenance_logs mml
+    JOIN molds m ON mml.mold_id = m.mold_id
+    JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
+    JOIN users u ON mml.technician_id = u.user_id
+    JOIN maintenance_result_statuses mrs ON mml.result_status_id = mrs.status_id
+    WHERE 1=1
+    """
+
+    params = []
+    if selected_type_id != 0:
+        query += " AND mml.maintenance_type_id = %s"
+        params.append(selected_type_id)
+    if selected_status_id != 0:
+        query += " AND mml.result_status_id = %s"
+        params.append(selected_status_id)
+    if time_range != '全部':
+        days_map = {'最近7天': 7, '最近30天': 30, '最近90天': 90}
+        days = days_map[time_range]
+        query += " AND mml.maintenance_start_timestamp >= %s"
+        params.append(datetime.now() - timedelta(days=days))
+
+    query += " ORDER BY mml.maintenance_start_timestamp DESC LIMIT 100"
+    return query, params
+
+
+def _build_maintenance_description(problem_description=None, actions_taken=None, notes=None):
+    parts = []
+    if problem_description:
+        parts.append(f"问题描述: {problem_description}")
+    if actions_taken:
+        parts.append(f"处理措施: {actions_taken}")
+    if notes:
+        parts.append(f"备注: {notes}")
+    return "\n".join(parts) if parts else None
+
+
+def _build_maintenance_statistics_queries():
+    stats_query = """
+    SELECT
+        COUNT(*) as total_records,
+        COUNT(CASE WHEN maintenance_end_timestamp IS NOT NULL THEN 1 END) as completed_records,
+        COUNT(CASE WHEN mt.is_repair = true THEN 1 END) as repair_records,
+        COUNT(CASE WHEN mt.is_repair = false THEN 1 END) as maintenance_records,
+        COALESCE(SUM(cost), 0) as total_cost,
+        COALESCE(AVG(cost), 0) as avg_cost
+    FROM mold_maintenance_logs mml
+    JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
+    WHERE mml.maintenance_start_timestamp BETWEEN %s AND %s
+    """
+
+    type_stats_query = """
+    SELECT
+        mt.type_name,
+        mt.is_repair,
+        COUNT(*) as record_count,
+        COALESCE(SUM(mml.cost), 0) as total_cost,
+        COALESCE(AVG(mml.cost), 0) as avg_cost
+    FROM mold_maintenance_logs mml
+    JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
+    WHERE mml.maintenance_start_timestamp BETWEEN %s AND %s
+    GROUP BY mt.type_id, mt.type_name, mt.is_repair
+    ORDER BY record_count DESC
+    """
+
+    trend_query = """
+    SELECT
+        strftime('%Y-%m-01', mml.maintenance_start_timestamp) as month,
+        COUNT(*) as record_count,
+        COUNT(CASE WHEN mt.is_repair = true THEN 1 END) as repair_count,
+        COUNT(CASE WHEN mt.is_repair = false THEN 1 END) as maintenance_count,
+        COALESCE(SUM(mml.cost), 0) as total_cost
+    FROM mold_maintenance_logs mml
+    JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
+    WHERE mml.maintenance_start_timestamp >= %s
+    GROUP BY strftime('%Y-%m-01', mml.maintenance_start_timestamp)
+    ORDER BY month
+    """
+
+    return stats_query, type_stats_query, trend_query
+
 # --- Helper Functions ---
 
 def get_maintenance_types():
@@ -480,23 +616,23 @@ def save_maintenance_record(mold_id, maintenance_type_id, maintained_by_id, star
             # 插入维修记录
             insert_query = """
             INSERT INTO mold_maintenance_logs (
-                mold_id, maintenance_type_id, maintained_by_id,
+                mold_id, maintenance_type_id, technician_id,
                 maintenance_start_timestamp, maintenance_end_timestamp,
-                problem_description, actions_taken, maintenance_cost,
-                result_status_id, replaced_parts_info, notes
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                description, cost, result_status_id, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING log_id
             """
-            
-            # 将 replaced_parts_info 转换为 JSON 字符串
-            import json
-            replaced_parts_json = json.dumps(replaced_parts_info) if replaced_parts_info else None
+            combined_description = _build_maintenance_description(
+                problem_description=problem_description,
+                actions_taken=actions_taken,
+                notes=notes,
+            )
             
             cursor.execute(insert_query, (
                 mold_id, maintenance_type_id, maintained_by_id,
                 start_timestamp, end_timestamp,
-                problem_description, actions_taken, maintenance_cost,
-                result_status_id, replaced_parts_json, notes
+                combined_description, maintenance_cost,
+                result_status_id, datetime.now()
             ))
             
             log_id = cursor.fetchone()[0]
@@ -573,49 +709,7 @@ def view_maintenance_tasks():
         )
     
     # 构建查询
-    query = """
-    SELECT 
-        mml.log_id,
-        m.mold_code,
-        m.mold_name,
-        mt.type_name as maintenance_type,
-        mt.is_repair,
-        u.full_name as maintained_by,
-        mml.maintenance_start_timestamp,
-        mml.maintenance_end_timestamp,
-        mml.problem_description,
-        mml.actions_taken,
-        mml.maintenance_cost,
-        mrs.status_name as result_status,
-        mml.notes,
-        mml.replaced_parts_info
-    FROM mold_maintenance_logs mml
-    JOIN molds m ON mml.mold_id = m.mold_id
-    JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
-    JOIN users u ON mml.maintained_by_id = u.user_id
-    JOIN maintenance_result_statuses mrs ON mml.result_status_id = mrs.status_id
-    WHERE 1=1
-    """
-    
-    params = []
-    
-    # 添加筛选条件
-    if selected_type_id != 0:
-        query += " AND mml.maintenance_type_id = %s"
-        params.append(selected_type_id)
-    
-    if selected_status_id != 0:
-        query += " AND mml.result_status_id = %s"
-        params.append(selected_status_id)
-    
-    # 时间范围筛选
-    if time_range != '全部':
-        days_map = {'最近7天': 7, '最近30天': 30, '最近90天': 90}
-        days = days_map[time_range]
-        query += " AND mml.maintenance_start_timestamp >= %s"
-        params.append(datetime.now() - timedelta(days=days))
-    
-    query += " ORDER BY mml.maintenance_start_timestamp DESC LIMIT 100"
+    query, params = _build_maintenance_records_query(selected_type_id, selected_status_id, time_range)
     
     # 执行查询
     try:
@@ -667,12 +761,15 @@ def view_maintenance_tasks():
                     st.write(f"**记录ID:** {record['log_id']}")
                     st.write(f"**维修类型:** {record['maintenance_type']}")
                     st.write(f"**执行人:** {record['maintained_by']}")
-                    st.write(f"**开始时间:** {record['maintenance_start_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                    st.write(f"**开始时间:** {_format_maintenance_datetime(record.get('maintenance_start_timestamp'), '%Y-%m-%d %H:%M')}")
                     
                     if record['maintenance_end_timestamp']:
-                        st.write(f"**结束时间:** {record['maintenance_end_timestamp'].strftime('%Y-%m-%d %H:%M')}")
-                        duration = record['maintenance_end_timestamp'] - record['maintenance_start_timestamp']
-                        st.write(f"**耗时:** {duration}")
+                        st.write(f"**结束时间:** {_format_maintenance_datetime(record.get('maintenance_end_timestamp'), '%Y-%m-%d %H:%M')}")
+                        start_dt = _to_maintenance_datetime(record.get('maintenance_start_timestamp'))
+                        end_dt = _to_maintenance_datetime(record.get('maintenance_end_timestamp'))
+                        if start_dt and end_dt:
+                            duration = end_dt - start_dt
+                            st.write(f"**耗时:** {duration}")
                     
                     if record['maintenance_cost']:
                         st.write(f"**维修成本:** ¥{record['maintenance_cost']:,.2f}")
@@ -731,8 +828,19 @@ def update_maintenance_task():
     
     # 获取任务详情
     query = """
-    SELECT 
-        mml.*,
+    SELECT
+        mml.log_id,
+        mml.mold_id,
+        mml.maintenance_type_id,
+        mml.technician_id AS maintained_by_id,
+        mml.result_status_id,
+        mml.maintenance_start_timestamp,
+        mml.maintenance_end_timestamp,
+        mml.description AS problem_description,
+        '' AS actions_taken,
+        mml.cost AS maintenance_cost,
+        '' AS notes,
+        NULL AS replaced_parts_info,
         m.mold_code,
         m.mold_name,
         mt.type_name as maintenance_type,
@@ -741,7 +849,7 @@ def update_maintenance_task():
     FROM mold_maintenance_logs mml
     JOIN molds m ON mml.mold_id = m.mold_id
     JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
-    JOIN users u ON mml.maintained_by_id = u.user_id
+    JOIN users u ON mml.technician_id = u.user_id
     JOIN maintenance_result_statuses mrs ON mml.result_status_id = mrs.status_id
     WHERE mml.log_id = %s
     """
@@ -787,10 +895,11 @@ def update_maintenance_task():
                         end_date = None
                         end_time = None
                 else:
-                    st.write(f"**完成时间:** {task['maintenance_end_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                    st.write(f"**完成时间:** {_format_maintenance_datetime(task.get('maintenance_end_timestamp'), '%Y-%m-%d %H:%M')}")
                     task_completed = True
-                    end_date = task['maintenance_end_timestamp'].date()
-                    end_time = task['maintenance_end_timestamp'].time()
+                    end_dt = _to_maintenance_datetime(task.get('maintenance_end_timestamp'))
+                    end_date = end_dt.date() if end_dt else date.today()
+                    end_time = end_dt.time() if end_dt else datetime.now().time()
             
             with col2:
                 # 维修成本
@@ -868,18 +977,28 @@ def update_maintenance_task():
                         
                         # 成本更新
                         if new_cost != current_cost:
-                            update_fields.append("maintenance_cost = %s")
+                            update_fields.append("cost = %s")
                             update_params.append(new_cost if new_cost > 0 else None)
                         
                         # 处理措施更新
                         if updated_actions != current_actions:
-                            update_fields.append("actions_taken = %s")
-                            update_params.append(updated_actions)
+                            merged_description = _build_maintenance_description(
+                                problem_description=task.get('problem_description'),
+                                actions_taken=updated_actions,
+                                notes=updated_notes if updated_notes != current_notes else current_notes
+                            )
+                            update_fields.append("description = %s")
+                            update_params.append(merged_description)
                         
                         # 备注更新
-                        if updated_notes != current_notes:
-                            update_fields.append("notes = %s")
-                            update_params.append(updated_notes)
+                        if updated_notes != current_notes and updated_actions == current_actions:
+                            merged_description = _build_maintenance_description(
+                                problem_description=task.get('problem_description'),
+                                actions_taken=current_actions,
+                                notes=updated_notes
+                            )
+                            update_fields.append("description = %s")
+                            update_params.append(merged_description)
                         
                         # 更换部件信息更新
                         if new_part_name and new_part_quantity > 0:
@@ -901,16 +1020,16 @@ def update_maintenance_task():
                             current_parts.append(new_part)
                             
                             import json
-                            update_fields.append("replaced_parts_info = %s")
-                            update_params.append(json.dumps(current_parts))
+                            # 当前 SQLite schema 无 replaced_parts_info 字段，暂不单独持久化
                         
                         # 执行更新
                         if update_fields:
                             update_query = f"""
                             UPDATE mold_maintenance_logs 
-                            SET {', '.join(update_fields)}
+                            SET {', '.join(update_fields)}, updated_at = %s
                             WHERE log_id = %s
                             """
+                            update_params.append(datetime.now())
                             update_params.append(task_id)
                             
                             cursor.execute(update_query, tuple(update_params))
@@ -966,19 +1085,7 @@ def maintenance_statistics():
         end_date = st.date_input("结束日期", value=date.today())
     
     try:
-        # 总体统计
-        stats_query = """
-        SELECT 
-            COUNT(*) as total_records,
-            COUNT(CASE WHEN maintenance_end_timestamp IS NOT NULL THEN 1 END) as completed_records,
-            COUNT(CASE WHEN mt.is_repair = true THEN 1 END) as repair_records,
-            COUNT(CASE WHEN mt.is_repair = false THEN 1 END) as maintenance_records,
-            COALESCE(SUM(maintenance_cost), 0) as total_cost,
-            COALESCE(AVG(maintenance_cost), 0) as avg_cost
-        FROM mold_maintenance_logs mml
-        JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
-        WHERE mml.maintenance_start_timestamp BETWEEN %s AND %s
-        """
+        stats_query, type_stats_query, trend_query = _build_maintenance_statistics_queries()
         
         start_datetime = datetime.combine(start_date, datetime.min.time())
         end_datetime = datetime.combine(end_date, datetime.max.time())
@@ -1007,19 +1114,6 @@ def maintenance_statistics():
         
         # 按类型统计
         st.markdown("### 📈 按维修类型统计")
-        type_stats_query = """
-        SELECT 
-            mt.type_name,
-            mt.is_repair,
-            COUNT(*) as record_count,
-            COALESCE(SUM(mml.maintenance_cost), 0) as total_cost,
-            COALESCE(AVG(mml.maintenance_cost), 0) as avg_cost
-        FROM mold_maintenance_logs mml
-        JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
-        WHERE mml.maintenance_start_timestamp BETWEEN %s AND %s
-        GROUP BY mt.type_id, mt.type_name, mt.is_repair
-        ORDER BY record_count DESC
-        """
         
         type_stats = execute_query(type_stats_query, params=(start_datetime, end_datetime), fetch_all=True)
         
@@ -1070,21 +1164,8 @@ def maintenance_statistics():
         
         # 月度趋势分析
         st.markdown("### 📅 月度趋势分析")
-        trend_query = """
-        SELECT 
-            DATE_TRUNC('month', mml.maintenance_start_timestamp) as month,
-            COUNT(*) as record_count,
-            COUNT(CASE WHEN mt.is_repair = true THEN 1 END) as repair_count,
-            COUNT(CASE WHEN mt.is_repair = false THEN 1 END) as maintenance_count,
-            COALESCE(SUM(mml.maintenance_cost), 0) as total_cost
-        FROM mold_maintenance_logs mml
-        JOIN maintenance_types mt ON mml.maintenance_type_id = mt.type_id
-        WHERE mml.maintenance_start_timestamp >= %s - INTERVAL '6 months'
-        GROUP BY DATE_TRUNC('month', mml.maintenance_start_timestamp)
-        ORDER BY month
-        """
-        
-        trend_stats = execute_query(trend_query, params=(start_datetime,), fetch_all=True)
+        trend_start = datetime.combine((end_date - timedelta(days=180)), datetime.min.time())
+        trend_stats = execute_query(trend_query, params=(trend_start,), fetch_all=True)
         
         if trend_stats:
             df_trend = pd.DataFrame(trend_stats)
@@ -1240,13 +1321,22 @@ ON CONFLICT (type_name) DO NOTHING;
 
 def show():
     """主函数 - 显示维修保养管理页面"""
-    st.title("🔧 维修保养管理")
-    
+    from utils.ui import inject_global_css, page_header
+    from utils.nav import setup_sidebar
+    inject_global_css()
+
+    if not st.session_state.get('logged_in'):
+        st.error("🔒 请先登录以访问此页面。")
+        st.stop()
+
     # 权限检查
     user_role = st.session_state.get('user_role', '')
     if user_role not in ['超级管理员', '模具库管理员', '模具工']:
-        st.warning("您没有权限访问此功能")
+        st.error("❌ 权限不足：您无法访问维修管理功能。")
         return
+
+    setup_sidebar("3_维修管理.py")
+    page_header("🔧", "维修保养管理", "预警提醒 · 任务管理 · 统计分析")
     
     # 使用说明
     with st.expander("💡 使用说明", expanded=False):
@@ -1334,11 +1424,4 @@ def show():
                     del st.session_state[key]
             st.rerun()
 
-if __name__ == "__main__":
-    # 用于独立测试的模拟会话状态
-    if 'user_id' not in st.session_state:
-        st.session_state['user_id'] = 1
-        st.session_state['user_role'] = '模具库管理员'
-        st.session_state['username'] = 'test_admin'
-    
-    show()
+show()

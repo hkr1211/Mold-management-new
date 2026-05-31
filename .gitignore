@@ -1,0 +1,25 @@
+
+# TLS 证书（本地生成，不入库）
+nginx/ssl/*.crt
+nginx/ssl/*.key
+nginx/ssl/*.pem
+
+# 数据库备份
+db_backups/
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# SQLite 运行时数据库（由 sql/sqlite_init.sql 自动初始化，不入库）
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# 离线安装包（体积大，按需单独分发，不入库）
+packages/
+
+# 编辑器 / Agent / 系统产物
+.claude/
+.DS_Store

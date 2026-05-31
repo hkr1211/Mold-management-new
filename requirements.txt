@@ -1,22 +1,18 @@
 # Web UI
-streamlit>=1.32,<2
+streamlit>=1.28
 
 # Data
-pandas>=2.0,<3
-numpy>=1.24,<3
+pandas>=2.0
+numpy>=1.24
 
 # Charts
-plotly>=5.18,<6
+plotly>=5.18
 
 # Auth
-bcrypt>=4,<5
+bcrypt>=4
 
-# System / Ops
-psutil>=5.9,<6
-
-# Schema docs / migrations (历史遗留仍会 import)
-SQLAlchemy>=2,<3
-alembic>=1.12,<2
+# System / Ops (psutil 6.0+ required for Python 3.13)
+psutil>=6.0
 
 # Tests
-pytest>=8,<9
+pytest>=8

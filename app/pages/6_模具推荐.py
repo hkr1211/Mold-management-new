@@ -5,11 +5,45 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from utils.database import execute_query
 from utils.auth import require_permission
+from utils.ui import inject_global_css, page_header
+from utils.nav import setup_sidebar
+
+
+def _build_recommendation_history_query():
+    """构建兼容当前 SQLite schema 的推荐历史查询"""
+    return """
+    SELECT
+        mr.recommendation_id,
+        mr.created_at,
+        '' AS order_code,
+        COALESCE(p.product_name, '') AS product_name,
+        m.mold_code,
+        m.mold_name,
+        mr.score AS recommendation_score,
+        0 AS is_selected,
+        mr.reason AS recommendation_reason
+    FROM mold_recommendations mr
+    LEFT JOIN products p ON mr.product_id = p.product_id
+    LEFT JOIN molds m ON mr.mold_id = m.mold_id
+    WHERE mr.created_at BETWEEN %s AND %s
+    ORDER BY mr.created_at DESC
+    """
+
+
+def _build_save_recommendation_insert_query():
+    """构建兼容当前 SQLite schema 的推荐结果保存 SQL"""
+    return """
+    INSERT INTO mold_recommendations
+    (mold_id, product_id, score, reason, created_at)
+    VALUES (%s, %s, %s, %s, %s)
+    """
 
 @require_permission('view_molds')
 def show():
     """模具推荐主页面"""
-    st.title("🎯 智能模具推荐")
+    inject_global_css()
+    setup_sidebar("6_模具推荐.py")
+    page_header("🤖", "智能模具推荐", "综合评分 · 智能匹配 · 推荐历史")
     
     # 添加使用说明
     with st.expander("💡 使用说明", expanded=False):
@@ -385,24 +419,7 @@ def show_recommendation_history():
         end_date = st.date_input("结束日期", datetime.now())
     
     # 查询推荐历史
-    query = """
-    SELECT 
-        mr.recommendation_id,
-        mr.created_at,
-        po.order_code,
-        p.product_name,
-        m.mold_code,
-        m.mold_name,
-        mr.recommendation_score,
-        mr.is_selected,
-        mr.recommendation_reason
-    FROM mold_recommendations mr
-    JOIN production_orders po ON mr.order_id = po.order_id
-    JOIN products p ON po.product_id = p.product_id
-    JOIN molds m ON mr.mold_id = m.mold_id
-    WHERE mr.created_at BETWEEN %s AND %s
-    ORDER BY mr.created_at DESC
-    """
+    query = _build_recommendation_history_query()
     
     try:
         results = execute_query(query, params=(start_date, end_date), fetch_all=True)
@@ -410,7 +427,7 @@ def show_recommendation_history():
         if results:
             # 统计信息
             total_recommendations = len(results)
-            selected_count = len([r for r in results if r['is_selected']])
+            selected_count = len([r for r in results if r.get('is_selected')])
             acceptance_rate = (selected_count / total_recommendations * 100) if total_recommendations > 0 else 0
             
             col1, col2, col3 = st.columns(3)
@@ -426,7 +443,7 @@ def show_recommendation_history():
             
             df = pd.DataFrame(results)
             df['推荐时间'] = pd.to_datetime(df['created_at']).dt.strftime('%Y-%m-%d %H:%M')
-            df['是否采纳'] = df['is_selected'].map({True: '✅ 已采纳', False: '❌ 未采纳'})
+            df['是否采纳'] = df['is_selected'].map({True: '✅ 已采纳', False: '❌ 未采纳', 0: '❌ 未采纳'})
             df['推荐分数'] = df['recommendation_score'].apply(lambda x: f"{x:.1f}")
             
             st.dataframe(
@@ -483,35 +500,31 @@ def get_mold_recommendations_by_spec(spec_info):
 def save_recommendation_selection(order_code, mold_id):
     """保存推荐选择"""
     try:
-        # 获取订单ID
-        order_query = "SELECT order_id FROM production_orders WHERE order_code = %s"
+        order_query = """
+        SELECT order_id, product_id
+        FROM production_orders
+        WHERE order_code = %s
+        """
         order_result = execute_query(order_query, params=(order_code,), fetch_one=True)
-        
+
         if order_result:
-            order_id = order_result['order_id']
-            
-            # 更新选择状态
-            update_query = """
-            UPDATE mold_recommendations 
-            SET is_selected = TRUE 
-            WHERE order_id = %s AND mold_id = %s
-            """
-            
-            execute_query(update_query, params=(order_id, mold_id), commit=True)
-            
-            # 记录操作日志
+            insert_query = _build_save_recommendation_insert_query()
+            execute_query(
+                insert_query,
+                params=(
+                    mold_id,
+                    order_result['product_id'],
+                    100.0,
+                    f"订单 {order_code} 选择了该模具",
+                    datetime.now()
+                ),
+                commit=True
+            )
+
             from utils.auth import log_user_action
             log_user_action('SELECT_MOLD', 'mold_recommendations', f"{order_code}_{mold_id}")
             
     except Exception as e:
         st.error(f"保存选择失败: {e}")
 
-if __name__ == "__main__":
-    # 模拟登录状态用于测试
-    if 'logged_in' not in st.session_state:
-        st.session_state['logged_in'] = True
-        st.session_state['user_id'] = 1
-        st.session_state['user_role'] = '模具库管理员'
-        st.session_state['username'] = 'test_admin'
-    
-    show()
+show()
