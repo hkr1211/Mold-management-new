@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import sqlite3
 from datetime import datetime, timedelta
 from utils.database import execute_query
 from utils.auth import require_permission
@@ -300,7 +301,7 @@ def get_mold_recommendations(order_info):
             recommendations.append(rec)
         
         return recommendations
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取推荐失败: {e}")
         return []
 
@@ -403,8 +404,8 @@ def show_quick_search():
                                 st.session_state['selected_mold_id'] = mold['mold_id']
             else:
                 st.info("未找到匹配的模具")
-                
-        except Exception as e:
+
+        except sqlite3.Error as e:
             st.error(f"查询失败: {e}")
 
 def show_recommendation_history():
@@ -459,8 +460,8 @@ def show_recommendation_history():
             )
         else:
             st.info("暂无推荐历史记录")
-            
-    except Exception as e:
+
+    except sqlite3.Error as e:
         st.error(f"查询失败: {e}")
 
 # 辅助函数
@@ -488,7 +489,7 @@ def get_order_info(order_code):
     try:
         result = execute_query(query, params=(order_code,), fetch_one=True)
         return dict(result) if result else None
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"查询订单失败: {e}")
         return None
 
@@ -523,8 +524,8 @@ def save_recommendation_selection(order_code, mold_id):
 
             from utils.auth import log_user_action
             log_user_action('SELECT_MOLD', 'mold_recommendations', f"{order_code}_{mold_id}")
-            
-    except Exception as e:
+
+    except sqlite3.Error as e:
         st.error(f"保存选择失败: {e}")
 
 show()
