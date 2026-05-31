@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import sqlite3
 from datetime import datetime, timedelta, time
 from utils.database import execute_query
 from utils.auth import require_permission
@@ -50,7 +51,7 @@ def get_available_equipment():
     try:
         results = execute_query(query, fetch_all=True)
         return [dict(r) for r in results] if results else []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取设备列表失败: {e}")
         return []
 
@@ -67,7 +68,7 @@ def get_available_operators():
     try:
         results = execute_query(query, fetch_all=True)
         return [dict(r) for r in results] if results else []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取操作工列表失败: {e}")
         return []
 
@@ -89,7 +90,7 @@ def get_recommended_molds_for_order(order_info):
     try:
         results = execute_query(query, fetch_all=True)
         return [dict(r) for r in results] if results else []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取推荐模具失败: {e}")
         return []
 
@@ -129,7 +130,7 @@ def check_schedule_conflicts(schedule_date, start_time, end_time, mold_id, equip
             if row.get('operator_id') == operator_id:
                 conflicts.append(f"操作工冲突：订单 {row['order_code']} 在该时段已被安排")
         return conflicts
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"检查排程冲突失败: {e}")
         return ["系统无法完成冲突检查"]
 
@@ -157,7 +158,7 @@ def create_schedule_record(order_id, mold_id, equipment_id, operator_id, schedul
             commit=True
         )
         return rowcount > 0
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"创建排程失败: {e}")
         return False
 
@@ -847,7 +848,7 @@ def get_schedule_data(start_date, end_date):
     try:
         results = execute_query(query, params=(start_date, end_date), fetch_all=True)
         return [dict(r) for r in results] if results else []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取排程数据失败: {e}")
         return []
 
@@ -955,7 +956,7 @@ def get_pending_orders():
     try:
         results = execute_query(query, fetch_all=True)
         return [dict(r) for r in results] if results else []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取待排程订单失败: {e}")
         return []
 
