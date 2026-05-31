@@ -3,6 +3,7 @@
 import streamlit as st
 import bcrypt
 import functools
+import sqlite3
 from utils.database import execute_query, check_table_exists
 import logging
 import json
@@ -74,7 +75,7 @@ def check_password(username: str, password: str):
                     role_result = execute_query(role_query, params=(user['role_id'],), fetch_one=True)
                     if role_result:
                         role_name = role_result['role_name']
-                except Exception as e:
+                except sqlite3.Error as e:
                     logger.error(f"获取角色失败: {e}")
                     return None  # 失败不登录
             
@@ -93,7 +94,7 @@ def check_password(username: str, password: str):
             logger.warning(f"密码验证失败: {username}")
             return None
             
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"登录查询错误: {e}")
         return None
 
@@ -119,7 +120,7 @@ def _get_lockout_record(username: str):
             "SELECT attempts, locked_until FROM login_attempts WHERE username = %s",
             params=(username,), fetch_one=True
         )
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"读取登录锁定记录失败: {e}")
         return None
 
@@ -153,7 +154,7 @@ def _register_failed_attempt(username: str) -> None:
             """,
             params=(username, attempts, now, locked_until), commit=True
         )
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"写入登录失败计数失败: {e}")
 
 def _reset_attempts(username: str) -> None:
@@ -163,7 +164,7 @@ def _reset_attempts(username: str) -> None:
             "DELETE FROM login_attempts WHERE username = %s",
             params=(username,), commit=True
         )
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"清除登录失败计数失败: {e}")
 
 def login_user(username: str, password: str):
@@ -267,7 +268,7 @@ def get_all_users(offset: int = 0, limit: int = 100):
         result = execute_query(query, params=(limit, offset), fetch_all=True)
         logger.info(f"获取用户列表成功，共 {len(result) if result else 0} 个用户")
         return result or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取用户列表失败: {e}")
         return []
 
@@ -318,7 +319,7 @@ def create_user(username: str, password: str, full_name: str,
             return True, "用户创建成功"
         else:
             return False, "用户创建失败"
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"创建用户失败: {e}")
         return False, f"创建失败: {str(e)}"
 
@@ -332,7 +333,7 @@ def update_user_status(user_id: int, is_active: bool):
             return True, f"用户已{status_text}"
         else:
             return False, "用户不存在"
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"更新用户状态失败: {e}")
         return False, f"更新失败: {str(e)}"
 
@@ -365,7 +366,7 @@ def get_user_activity_log(user_id=None, days=7):
             params = (cutoff,)
         
         return execute_query(query, params=params, fetch_all=True) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取活动日志失败: {e}")
         return []
 
@@ -376,7 +377,7 @@ def get_all_roles():
         result = execute_query(query, fetch_all=True)
         logger.info(f"获取角色列表成功，共 {len(result) if result else 0} 个角色")
         return result or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取角色列表失败: {e}")
         return []
 
@@ -434,6 +435,6 @@ def update_user_password(user_id: int, new_password: str):
             return True, "密码更新成功"
         else:
             return False, "用户不存在"
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"更新密码失败: {e}")
         return False, f"更新失败: {str(e)}"

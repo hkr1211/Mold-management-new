@@ -263,3 +263,31 @@ class TestCreateUserCompatibility:
 
         assert ok is True
         assert msg == "用户创建成功"
+
+
+# ══════════════════════════════════════════════════════════════════
+# 错误处理约定：数据库故障降级，编码缺陷上抛（与 database.py 一致）
+# ══════════════════════════════════════════════════════════════════
+
+class TestErrorHandlingContract:
+    """auth 数据访问函数只吞 sqlite3.Error，其余异常（编码缺陷）必须上抛。"""
+
+    def teardown_method(self):
+        _auth_module.execute_query = lambda *a, **kw: None  # 复位，避免污染其它用例
+
+    def test_db_error_returns_safe_default(self):
+        import sqlite3
+
+        def boom(*a, **kw):
+            raise sqlite3.OperationalError("database is locked")
+
+        _auth_module.execute_query = boom
+        assert _auth_module.get_all_roles() == []  # 降级，不崩
+
+    def test_programming_error_propagates(self):
+        def boom(*a, **kw):
+            raise ValueError("编码缺陷")
+
+        _auth_module.execute_query = boom
+        with pytest.raises(ValueError):
+            _auth_module.get_all_roles()  # 不再被吞成 []
