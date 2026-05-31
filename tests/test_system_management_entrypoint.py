@@ -1,9 +1,11 @@
 # tests/test_system_management_entrypoint.py — 系统管理页面入口回归测试
-# 验证：授权（超级管理员）空数据下加载 3 个 tab 不崩、不误报失败。
+# 验证：删除调试后门（模拟登录赋值）后，页面底部直接调用 show()，访问控制守卫真正生效：
+#   未登录          -> st.error("...登录...") + st.stop（SystemExit）
+#   非超级管理员     -> st.error("...权限...") + return（不 st.stop）
+#   超级管理员       -> 3 个 tab 空数据加载不崩、不误报失败
 #
-# 注：本页 show() 仅在 `if __name__ == "__main__":` 块内调用，且该块在未登录时
-# 会强制写入 logged_in=True / 超级管理员（调试后门，另案处理），导致访问控制守卫
-# 无法在此被独立测试。因此这里只保留授权加载回归，以 __main__ 方式执行使 show() 真正运行。
+# 参考 tests/test_maintenance_entrypoint.py / test_mold_management_entrypoint.py 的
+# _DummyContext 代理 mock 写法。
 
 import os
 import sys
@@ -86,7 +88,7 @@ def _load_page(st_mock, has_perm=lambda perm: True):
     sys.modules["pandas"] = pd
     sys.modules["psutil"] = _build_psutil_mock()
 
-    # 清除其它测试残留的 plotly mock 占位，强制真实导入
+    # 清除其它测试残留的 plotly mock 占位，强制真实导入（否则 go.Scatter 报 AttributeError）
     for _m in ("plotly.graph_objects", "plotly.express", "plotly"):
         _mod = sys.modules.get(_m)
         if _mod is not None and not getattr(_mod, "__file__", None):
@@ -128,13 +130,29 @@ def _load_page(st_mock, has_perm=lambda perm: True):
     with open(page_path, encoding="utf-8") as f:
         src = f.read()
 
+    # 后门已移除：页面底部直接 `show()`，exec 即执行访问控制守卫。
     module = types.ModuleType("sysmgmt_page")
-    module.__dict__["__name__"] = "__main__"  # 使页面底部 `if __name__=="__main__": show()` 运行
     exec(compile(src, "5_系统管理.py", "exec"), module.__dict__)
     return module
 
 
+def test_blocks_unauthenticated_user():
+    """未登录用户应被 show() 顶部 st.error + st.stop 拦截（后门移除后守卫真正生效）。"""
+    st = _build_st_mock({})  # logged_in 未设置
+    with pytest.raises(SystemExit):
+        _load_page(st)
+    assert any("登录" in msg for msg in st._error_calls)
+
+
+def test_blocks_unauthorized_role():
+    """已登录但非超级管理员应被权限错误拦截（st.error 含“权限”后 return，不 st.stop）。"""
+    st = _build_st_mock({"logged_in": True, "user_role": "访客", "user_id": 2})
+    _load_page(st)  # 非超管：error 后 return，不抛 SystemExit
+    assert any("权限" in msg for msg in st._error_calls)
+
+
 def test_authorized_load_does_not_crash():
+    """超级管理员空数据下加载 3 个 tab（用户管理/系统配置/系统监控）不应崩溃或误报失败。"""
     st = _build_st_mock({"logged_in": True, "user_role": "超级管理员", "user_id": 1})
-    _load_page(st)  # 顶层 show()：3 个 tab（用户管理/系统配置/系统监控）渲染不应抛异常
+    _load_page(st)
     assert all(("失败" not in msg and "出错" not in msg) for msg in st._error_calls)

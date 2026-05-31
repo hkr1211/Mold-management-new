@@ -362,9 +362,9 @@ def show_quick_search():
             m.theoretical_lifespan_strokes,
             m.accumulated_strokes,
             m.maintenance_cycle_strokes,
-            CASE 
-                WHEN m.theoretical_lifespan_strokes > 0 
-                THEN ROUND((m.accumulated_strokes::DECIMAL / m.theoretical_lifespan_strokes) * 100, 2)
+            CASE
+                WHEN m.theoretical_lifespan_strokes > 0
+                THEN ROUND(CAST(m.accumulated_strokes AS REAL) / m.theoretical_lifespan_strokes * 100, 2)
                 ELSE 0
             END as usage_percentage
         FROM molds m
@@ -468,7 +468,7 @@ def show_recommendation_history():
 def get_order_info(order_code):
     """获取订单信息"""
     query = """
-    SELECT 
+    SELECT
         po.order_id,
         po.order_code,
         po.quantity,
@@ -476,13 +476,9 @@ def get_order_info(order_code):
         po.priority,
         p.product_id,
         p.product_code,
-        p.product_name,
-        pt.type_name as product_type,
-        m.material_name
+        p.product_name
     FROM production_orders po
     JOIN products p ON po.product_id = p.product_id
-    JOIN product_types pt ON p.product_type_id = pt.type_id
-    JOIN materials m ON p.material_id = m.material_id
     WHERE po.order_code = %s
     """
     

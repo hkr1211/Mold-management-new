@@ -1501,12 +1501,5 @@ def verify_create_user_function():
                 st.error(f"测试创建用户时出错: {str(e)}")
 
 # 主函数
-if __name__ == "__main__":
-    # 模拟登录状态
-    if 'logged_in' not in st.session_state:
-        st.session_state['logged_in'] = True
-        st.session_state['user_id'] = 1
-        st.session_state['user_role'] = '超级管理员'
-        st.session_state['username'] = 'admin'
-    
-    show()
+# 访问控制由 show() 顶部统一处理（未登录 -> st.stop；非超级管理员 -> return）
+show()
