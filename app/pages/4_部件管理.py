@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import logging
+import sqlite3
 from datetime import date
 from utils.database import execute_query
 from utils.auth import has_permission, log_user_action
@@ -29,41 +30,39 @@ CAN_MANAGE = has_permission('manage_molds') or has_permission('manage_maintenanc
 # --- 数据加载 ---
 @st.cache_data(ttl=300)
 def load_parts(mold_filter="", category_filter="全部", status_filter="全部"):
-    try:
-        query = """
-        SELECT
-            p.part_id,
-            p.part_code     AS 部件编号,
-            p.part_name     AS 部件名称,
-            m.mold_code     AS 所属模具,
-            c.category_name AS 部件类别,
-            p.material      AS 材质,
-            p.supplier      AS 供应商,
-            p.installation_date AS 安装日期,
-            p.lifespan_strokes  AS 设计寿命,
-            ms.status_name  AS 状态,
-            p.remarks       AS 备注
-        FROM mold_parts p
-        JOIN molds m ON p.mold_id = m.mold_id
-        JOIN mold_part_categories c ON p.part_category_id = c.category_id
-        LEFT JOIN mold_statuses ms ON p.current_status_id = ms.status_id
-        ORDER BY p.created_at DESC
-        """
-        rows = execute_query(query, fetch_all=True) or []
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-
-        if mold_filter:
-            df = df[df['所属模具'].str.contains(mold_filter, case=False, na=False)]
-        if category_filter != "全部":
-            df = df[df['部件类别'] == category_filter]
-        if status_filter != "全部":
-            df = df[df['状态'] == status_filter]
+    # 数据加载不再吞异常：DB 故障与编码缺陷均向上抛，由调用方
+    # （show_parts_list）区分展示“加载失败”与“暂无数据”。
+    query = """
+    SELECT
+        p.part_id,
+        p.part_code     AS 部件编号,
+        p.part_name     AS 部件名称,
+        m.mold_code     AS 所属模具,
+        c.category_name AS 部件类别,
+        p.material      AS 材质,
+        p.supplier      AS 供应商,
+        p.installation_date AS 安装日期,
+        p.lifespan_strokes  AS 设计寿命,
+        ms.status_name  AS 状态,
+        p.remarks       AS 备注
+    FROM mold_parts p
+    JOIN molds m ON p.mold_id = m.mold_id
+    JOIN mold_part_categories c ON p.part_category_id = c.category_id
+    LEFT JOIN mold_statuses ms ON p.current_status_id = ms.status_id
+    ORDER BY p.created_at DESC
+    """
+    rows = execute_query(query, fetch_all=True) or []
+    df = pd.DataFrame(rows)
+    if df.empty:
         return df
-    except Exception as e:
-        logger.error(f"加载部件列表失败: {e}")
-        return pd.DataFrame()
+
+    if mold_filter:
+        df = df[df['所属模具'].str.contains(mold_filter, case=False, na=False)]
+    if category_filter != "全部":
+        df = df[df['部件类别'] == category_filter]
+    if status_filter != "全部":
+        df = df[df['状态'] == status_filter]
+    return df
 
 @st.cache_data(ttl=600)
 def load_part_lookups():
@@ -99,7 +98,12 @@ def show():
 
 # ===================== TAB1：部件列表 =====================
 def show_parts_list():
-    categories, _, statuses = load_part_lookups()
+    try:
+        categories, _, statuses = load_part_lookups()
+    except sqlite3.Error as e:
+        logger.error(f"加载部件字典失败: {e}")
+        st.error(f"❌ 数据加载失败：{e}")
+        return
     cat_names = ["全部"] + [c['category_name'] for c in categories]
     st_names = ["全部"] + [s['status_name'] for s in statuses]
 
@@ -113,7 +117,12 @@ def show_parts_list():
         st.cache_data.clear()
         st.rerun()
 
-    df = load_parts(mold_filter, cat_filter, sta_filter)
+    try:
+        df = load_parts(mold_filter, cat_filter, sta_filter)
+    except sqlite3.Error as e:
+        logger.error(f"加载部件列表失败: {e}")
+        st.error(f"❌ 数据加载失败：{e}")
+        return
 
     if df.empty:
         st.info("暂无符合条件的部件记录。")
@@ -141,7 +150,8 @@ def show_parts_list():
                         st.success(f"✅ 部件 {del_code} 已删除")
                         st.cache_data.clear()
                         st.rerun()
-                    except Exception as e:
+                    except sqlite3.Error as e:
+                        logger.error(f"删除部件失败: {e}")
                         st.error(f"❌ 删除失败：{e}")
 
 
@@ -151,7 +161,12 @@ def show_add_part_form():
         st.warning("🔒 您的角色没有新增部件的权限。")
         return
 
-    categories, molds, statuses = load_part_lookups()
+    try:
+        categories, molds, statuses = load_part_lookups()
+    except sqlite3.Error as e:
+        logger.error(f"加载部件字典失败: {e}")
+        st.error(f"❌ 数据加载失败：{e}")
+        return
 
     if not molds:
         st.warning("⚠️ 系统中暂无模具，请先创建模具后再添加部件。")
@@ -232,7 +247,7 @@ def show_add_part_form():
             log_user_action('CREATE_PART', 'mold_parts', part_name.strip())
             st.success(f"✅ 部件「{part_name}」新增成功！")
             st.cache_data.clear()
-        except Exception as e:
+        except sqlite3.Error as e:
             logger.error(f"新增部件失败: {e}")
             st.error(f"❌ 新增失败：{e}")
 
@@ -243,10 +258,15 @@ def show_pressure_ring_management():
     st.subheader("🔍 压边圈专项管理")
 
     # 查找压边圈类别 ID（如果不存在则给出提示）
-    cat_row = execute_query(
-        "SELECT category_id FROM mold_part_categories WHERE category_name ILIKE %s",
-        params=('%压边圈%',), fetch_one=True
-    )
+    try:
+        cat_row = execute_query(
+            "SELECT category_id FROM mold_part_categories WHERE category_name ILIKE %s",
+            params=('%压边圈%',), fetch_one=True
+        )
+    except sqlite3.Error as e:
+        logger.error(f"查询压边圈类别失败: {e}")
+        st.error(f"❌ 数据加载失败：{e}")
+        return
 
     if not cat_row:
         st.info("💡 系统中尚未创建「压边圈」部件类别。请管理员执行以下 SQL 创建后刷新：")
@@ -302,7 +322,7 @@ def show_pressure_ring_management():
                 ).reset_index()
                 st.dataframe(grouped, use_container_width=True, hide_index=True)
 
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"加载压边圈数据失败: {e}")
         st.error(f"加载失败：{e}")
 
