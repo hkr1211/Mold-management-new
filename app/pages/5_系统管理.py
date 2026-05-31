@@ -14,6 +14,7 @@ import psutil
 import numpy as np
 import os
 import logging
+import sqlite3
 from utils.auth import (
     has_permission, get_all_users, create_user, update_user_status,
     get_user_activity_log, get_all_roles, validate_password_strength,
@@ -117,7 +118,7 @@ def show_user_list():
             if st.button("重试获取数据"):
                 st.rerun()
             return
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取用户列表时出错: {str(e)}")
         if st.button("重试获取数据"):
             st.rerun()
@@ -1303,7 +1304,7 @@ def get_total_count(table_name):
         query = f"SELECT COUNT(*) as count FROM {table_name}"
         result = execute_query(query, fetch_one=True)
         return result['count'] if result else 0
-    except:
+    except sqlite3.Error:
         return 0
 
 def create_growth_trend_chart():
