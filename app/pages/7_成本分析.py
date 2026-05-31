@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import sqlite3
 from datetime import datetime, timedelta
 from utils.database import execute_query
 from utils.auth import require_permission
@@ -546,7 +547,7 @@ def get_cost_trend_data(start_date, end_date):
     try:
         results = execute_query(query, params=(start_date, end_date), fetch_all=True)
         return [dict(r) for r in results] if results else []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取趋势数据失败: {e}")
         return []
 
@@ -573,7 +574,7 @@ def get_cost_composition(start_date, end_date):
                 ]
             }
         return {'names': [], 'values': [], 'changes': []}
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取成本构成失败: {e}")
         return {'names': [], 'values': [], 'changes': []}
 
