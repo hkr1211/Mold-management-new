@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import logging
+import sqlite3
 from datetime import datetime, timedelta, date
 from utils.database import (
     execute_query, 
@@ -158,7 +159,7 @@ def get_maintenance_types():
     query = "SELECT type_id, type_name, is_repair, description FROM maintenance_types ORDER BY type_name"
     try:
         return execute_query(query, fetch_all=True) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取维修类型失败: {e}")
         return []
 
@@ -167,7 +168,7 @@ def get_maintenance_result_statuses():
     query = "SELECT status_id, status_name, description FROM maintenance_result_statuses ORDER BY status_name"
     try:
         return execute_query(query, fetch_all=True) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取维修结果状态失败: {e}")
         return []
 
@@ -216,7 +217,7 @@ def get_molds_needing_maintenance():
     """
     try:
         return execute_query(query, fetch_all=True) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取维修需求失败: {e}")
         return []
 
@@ -231,7 +232,7 @@ def get_user_technicians():
     """
     try:
         return execute_query(query, fetch_all=True) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取模具工列表失败: {e}")
         return []
 
@@ -269,7 +270,7 @@ def search_molds_for_maintenance(search_term=""):
     
     try:
         return execute_query(base_query, params=tuple(params), fetch_all=True) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"搜索模具失败: {e}")
         return []
 
@@ -663,7 +664,7 @@ def save_maintenance_record(mold_id, maintenance_type_id, maintained_by_id, star
             logging.info(f"Maintenance record created successfully: log_id={log_id}")
             return True
             
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Failed to save maintenance record: {e}", exc_info=True)
         st.error(f"保存维修记录失败: {e}")
         return False
@@ -808,7 +809,7 @@ def view_maintenance_tasks():
                     st.markdown("**备注:**")
                     st.info(record['notes'])
         
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取维修记录失败: {e}")
         logging.error(f"Failed to fetch maintenance records: {e}", exc_info=True)
 
@@ -1065,11 +1066,11 @@ def update_maintenance_task():
                         else:
                             st.info("没有检测到需要更新的内容")
                 
-                except Exception as e:
+                except sqlite3.Error as e:
                     st.error(f"更新任务失败: {e}")
                     logging.error(f"Failed to update maintenance task: {e}", exc_info=True)
-    
-    except Exception as e:
+
+    except sqlite3.Error as e:
         st.error(f"获取任务信息失败: {e}")
         logging.error(f"Failed to fetch task details: {e}", exc_info=True)
 
@@ -1220,7 +1221,7 @@ def maintenance_statistics():
             
             st.plotly_chart(fig_cost_trend, use_container_width=True)
     
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取统计数据失败: {e}")
         logging.error(f"Failed to fetch maintenance statistics: {e}", exc_info=True)
 
