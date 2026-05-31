@@ -26,10 +26,12 @@ import re as _re
 _src = open(os.path.join(os.path.dirname(__file__), '..', 'app', 'utils', 'database.py')).read()
 _src_patched = _re.sub(r'^initialize_database\(\)\s*$', '# initialize_database()',
                        _src, flags=_re.MULTILINE)
-# 将 DB_PATH 指向临时内存库，避免在测试环境下创建文件
-_src_patched = _src_patched.replace(
-    "from config.settings import DB_PATH, CACHE_TTL_SECONDS",
-    "DB_PATH = ':memory:'; CACHE_TTL_SECONDS = 300"
+# 将 DB_PATH 指向临时内存库，避免在测试环境下创建文件 / 污染真实库
+_src_patched = _re.sub(
+    r"from config\.settings import \([^)]*\)",
+    "DB_PATH = ':memory:'; CACHE_TTL_SECONDS = 300; "
+    "LOOKUP_CACHE_TTL = 600; DEFAULT_PAGE_SIZE = 100",
+    _src_patched,
 )
 _db_module = types.ModuleType('database')
 exec(compile(_src_patched, 'database.py', 'exec'), _db_module.__dict__)
@@ -178,3 +180,26 @@ class TestGetDbConnectionCompatibility:
             fetch_all=True
         )
         assert rows == [{"id": 1, "name": "alice"}]
+
+
+# ══════════════════════════════════════════════════════════════════
+# 错误处理约定：数据库故障降级，编码缺陷上抛（不伪装成空数据）
+# ══════════════════════════════════════════════════════════════════
+
+class TestErrorHandlingContract:
+    """数据检索函数只吞 sqlite3.Error，其余异常（编码缺陷）必须上抛。"""
+
+    def test_db_error_returns_safe_default(self):
+        # 查询不存在的表 → sqlite3.OperationalError → 降级返回 []，UI 不崩
+        assert _db_module.get_all_molds() == []
+
+    def test_programming_error_propagates(self):
+        # 传入非白名单表名属编码缺陷：应抛 ValueError，而非被吞成 []
+        with pytest.raises(ValueError):
+            _db_module.get_table_info('definitely_not_a_whitelisted_table')
+
+    def test_execute_query_reraises_on_bad_sql(self):
+        # 核心查询函数遇到 SQL 错误必须抛出，由调用方决定如何处理
+        import sqlite3
+        with pytest.raises(sqlite3.Error):
+            _db_module.execute_query("SELECT * FROM no_such_table_xyz", fetch_all=True)

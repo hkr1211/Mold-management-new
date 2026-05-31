@@ -224,7 +224,7 @@ def get_table_info(table_name: str) -> List[Dict]:
         cur = conn.cursor()
         cur.execute(f"PRAGMA table_info({table_name})")
         return [dict(r) for r in cur.fetchall()]
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取表 {table_name} 信息失败: {e}")
         return []
 
@@ -240,6 +240,9 @@ def check_table_exists(table_name: str) -> bool:
         return False
 
 # ── 专用查询函数 ─────────────────────────────────────────────────────
+# 错误处理约定：只捕获 sqlite3.Error（数据库层故障，降级返回安全默认值，
+# 避免 UI 崩溃）；其余异常（非法表名/列名、类型错误等编码缺陷）一律向上
+# 抛出，绝不伪装成空数据静默吞掉。
 def get_all_molds(offset: int = 0, limit: int = DEFAULT_PAGE_SIZE) -> List[Dict]:
     try:
         query = """
@@ -262,7 +265,7 @@ def get_all_molds(offset: int = 0, limit: int = DEFAULT_PAGE_SIZE) -> List[Dict]
         LIMIT %s OFFSET %s
         """
         return execute_query(query, params=(limit, offset), fetch_all=True) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取模具列表失败: {e}")
         return []
 
@@ -282,7 +285,7 @@ def get_mold_by_id(mold_id: int) -> Optional[Dict]:
         WHERE m.mold_id = %s
         """
         return execute_query(query, params=(mold_id,), fetch_one=True)
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取模具 {mold_id} 信息失败: {e}")
         return None
 
@@ -292,7 +295,7 @@ def get_loan_statuses() -> List[Dict]:
             "SELECT status_id, status_name, description FROM loan_statuses ORDER BY status_id",
             fetch_all=True
         ) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取借用状态失败: {e}")
         return []
 
@@ -302,7 +305,7 @@ def get_mold_statuses() -> List[Dict]:
             "SELECT status_id, status_name, description FROM mold_statuses ORDER BY status_id",
             fetch_all=True
         ) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取模具状态失败: {e}")
         return []
 
@@ -312,7 +315,7 @@ def get_storage_locations() -> List[Dict]:
             "SELECT location_id, location_name, description FROM storage_locations ORDER BY location_name",
             fetch_all=True
         ) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取存储位置失败: {e}")
         return []
 
@@ -322,7 +325,7 @@ def get_functional_types() -> List[Dict]:
             "SELECT type_id, type_name, description FROM mold_functional_types ORDER BY type_name",
             fetch_all=True
         ) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取功能类型失败: {e}")
         return []
 
