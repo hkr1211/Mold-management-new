@@ -82,18 +82,15 @@ def load_part_lookups():
 
 # ===================== 主页面 =====================
 def show():
-    page_header("🔩", "部件管理", "部件台账 · 新增 · 压边圈管理")
+    page_header("🔩", "部件管理", "部件台账 · 新增（含压边圈）")
 
-    tab1, tab2, tab3 = st.tabs(["📋 部件列表", "➕ 新增部件", "🔍 压边圈管理"])
+    tab1, tab2 = st.tabs(["📋 部件列表", "➕ 新增部件"])
 
     with tab1:
         show_parts_list()
 
     with tab2:
         show_add_part_form()
-
-    with tab3:
-        show_pressure_ring_management()
 
 
 # ===================== TAB1：部件列表 =====================
@@ -250,81 +247,6 @@ def show_add_part_form():
         except sqlite3.Error as e:
             logger.error(f"新增部件失败: {e}")
             st.error(f"❌ 新增失败：{e}")
-
-
-# ===================== TAB3：压边圈管理 =====================
-def show_pressure_ring_management():
-    """压边圈是特定类别的部件，单独展示便于专项管理"""
-    st.subheader("🔍 压边圈专项管理")
-
-    # 查找压边圈类别 ID（如果不存在则给出提示）
-    try:
-        cat_row = execute_query(
-            "SELECT category_id FROM mold_part_categories WHERE category_name ILIKE %s",
-            params=('%压边圈%',), fetch_one=True
-        )
-    except sqlite3.Error as e:
-        logger.error(f"查询压边圈类别失败: {e}")
-        st.error(f"❌ 数据加载失败：{e}")
-        return
-
-    if not cat_row:
-        st.info("💡 系统中尚未创建「压边圈」部件类别。请管理员执行以下 SQL 创建后刷新：")
-        st.code(
-            "INSERT INTO mold_part_categories (category_name, description) "
-            "VALUES ('压边圈', '模具压边圈部件') ON CONFLICT DO NOTHING;",
-            language="sql"
-        )
-        return
-
-    cat_id = cat_row['category_id']
-
-    try:
-        query = """
-        SELECT
-            p.part_id,
-            p.part_code     AS 编号,
-            p.part_name     AS 名称,
-            m.mold_code     AS 所属模具,
-            m.mold_name     AS 模具名称,
-            p.material      AS 材质,
-            p.installation_date AS 安装日期,
-            p.lifespan_strokes  AS 设计寿命,
-            ms.status_name  AS 状态,
-            p.remarks       AS 备注
-        FROM mold_parts p
-        JOIN molds m ON p.mold_id = m.mold_id
-        LEFT JOIN mold_statuses ms ON p.current_status_id = ms.status_id
-        WHERE p.part_category_id = %s
-        ORDER BY m.mold_code, p.part_code
-        """
-        rows = execute_query(query, params=(cat_id,), fetch_all=True) or []
-        df = pd.DataFrame(rows)
-
-        if df.empty:
-            st.info("暂无压边圈记录。可在「新增部件」中选择类别「压边圈」进行录入。")
-        else:
-            # 统计卡片
-            c1, c2, c3 = st.columns(3)
-            c1.metric("压边圈总数", len(df))
-            in_use = len(df[df['状态'] == '使用中']) if '使用中' in df['状态'].values else 0
-            c2.metric("使用中", in_use)
-            c3.metric("涉及模具数", df['所属模具'].nunique())
-
-            display_cols = ['编号', '名称', '所属模具', '模具名称', '材质', '安装日期', '设计寿命', '状态']
-            st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-
-            # 按模具分组显示
-            with st.expander("📊 按模具分组统计"):
-                grouped = df.groupby('所属模具').agg(
-                    压边圈数量=('名称', 'count'),
-                    使用中=('状态', lambda x: (x == '使用中').sum())
-                ).reset_index()
-                st.dataframe(grouped, use_container_width=True, hide_index=True)
-
-    except sqlite3.Error as e:
-        logger.error(f"加载压边圈数据失败: {e}")
-        st.error(f"加载失败：{e}")
 
 
 # --- 页面入口 ---
