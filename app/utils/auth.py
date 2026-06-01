@@ -337,6 +337,50 @@ def update_user_status(user_id: int, is_active: bool):
         logger.error(f"更新用户状态失败: {e}")
         return False, f"更新失败: {str(e)}"
 
+def update_user(user_id: int, full_name: str, email: str = None, role_name=None):
+    """更新用户基本信息（姓名/邮箱/角色）。用户名不可修改；启用状态与密码另有专用函数。
+
+    role_name 可传角色名或 role_id；传 None/'' 时保持原角色不变。
+    """
+    full_name = (full_name or '').strip()
+    if not full_name:
+        return False, "姓名不能为空"
+    email = email.strip() if (email and email.strip()) else None
+
+    set_clauses = ["full_name = %s", "email = %s"]
+    params = [full_name, email]
+
+    # 解析并更新角色（可选）
+    if role_name not in (None, ''):
+        if isinstance(role_name, int) or (isinstance(role_name, str) and role_name.isdigit()):
+            role_result = execute_query(
+                "SELECT role_id FROM roles WHERE role_id = %s",
+                params=(int(role_name),), fetch_one=True
+            )
+        else:
+            role_result = execute_query(
+                "SELECT role_id FROM roles WHERE role_name = %s",
+                params=(role_name,), fetch_one=True
+            )
+        if not role_result:
+            return False, f"角色 '{role_name}' 不存在"
+        set_clauses.append("role_id = %s")
+        params.append(role_result['role_id'])
+
+    set_clauses.append("updated_at = NOW()")
+    query = f"UPDATE users SET {', '.join(set_clauses)} WHERE user_id = %s"
+    params.append(user_id)
+
+    try:
+        rowcount = execute_query(query, params=tuple(params), commit=True)
+        if rowcount and rowcount > 0:
+            logger.info(f"用户信息更新成功: user_id={user_id}")
+            return True, "用户信息更新成功"
+        return False, "用户不存在"
+    except sqlite3.Error as e:
+        logger.error(f"更新用户信息失败: {e}")
+        return False, f"更新失败: {str(e)}"
+
 def get_user_activity_log(user_id=None, days=7):
     """获取用户活动日志"""
     try:

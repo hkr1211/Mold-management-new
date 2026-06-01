@@ -113,6 +113,7 @@ def _load_page(st_mock, has_perm=lambda perm: True):
     auth.get_all_users = lambda *a, **kw: []
     auth.create_user = lambda *a, **kw: (True, "ok")
     auth.update_user_status = lambda *a, **kw: (True, "ok")
+    auth.update_user = lambda *a, **kw: (True, "ok")
     auth.get_user_activity_log = lambda *a, **kw: []
     auth.get_all_roles = lambda *a, **kw: []
     auth.validate_password_strength = lambda *a, **kw: (True, "ok")
@@ -156,3 +157,40 @@ def test_authorized_load_does_not_crash():
     st = _build_st_mock({"logged_in": True, "user_role": "超级管理员", "user_id": 1})
     _load_page(st)
     assert all(("失败" not in msg and "出错" not in msg) for msg in st._error_calls)
+
+
+_SAMPLE_USER = {
+    "user_id": 7, "username": "bob", "full_name": "Bob",
+    "email": "b@x.com", "role_name": "模具工", "is_active": True,
+}
+
+
+def test_edit_user_form_renders_without_crash():
+    """设置 edit_user_id 后，编辑表单应能正常渲染（未保存时不改动状态）。"""
+    st = _build_st_mock({"logged_in": True, "user_role": "超级管理员", "user_id": 1})
+    module = _load_page(st)
+    st.session_state["edit_user_id"] = 7
+    module._render_edit_user_form([_SAMPLE_USER])  # 不抛异常
+    assert st.session_state.get("edit_user_id") == 7  # 未点保存/取消，保持编辑态
+
+
+def test_edit_user_save_invokes_update_user_and_clears_state():
+    """点击保存：调用 update_user、记录日志并清除 edit_user_id。"""
+    st = _build_st_mock({"logged_in": True, "user_role": "超级管理员", "user_id": 1})
+    module = _load_page(st)
+
+    captured = {}
+    module.update_user = lambda *a, **kw: (captured.setdefault("args", a), (True, "用户信息更新成功"))[1]
+    module.log_user_action = lambda *a, **kw: captured.setdefault("logged", a)
+    module.get_all_roles = lambda *a, **kw: []  # 角色列表留空，保存时不改角色
+
+    # 让“姓名”输入返回非空、“保存”按钮返回 True
+    st.text_input = lambda label, *a, **kw: ("新名字" if "姓名" in label else "")
+    st.form_submit_button = lambda label, *a, **kw: ("保存" in label)
+
+    st.session_state["edit_user_id"] = 7
+    module._render_edit_user_form([_SAMPLE_USER])
+
+    assert captured.get("args") == (7, "新名字", "", None)  # update_user 被以清洗后的值调用
+    assert "logged" in captured  # 记录了操作日志
+    assert "edit_user_id" not in st.session_state  # 保存后退出编辑态

@@ -291,3 +291,64 @@ class TestErrorHandlingContract:
         _auth_module.execute_query = boom
         with pytest.raises(ValueError):
             _auth_module.get_all_roles()  # 不再被吞成 []
+
+
+# ══════════════════════════════════════════════════════════════════
+# update_user — 更新用户基本信息（姓名/邮箱/角色）
+# ══════════════════════════════════════════════════════════════════
+
+class TestUpdateUser:
+
+    def teardown_method(self):
+        _auth_module.execute_query = lambda *a, **kw: None
+
+    def test_updates_fields_and_resolves_role(self):
+        calls = []
+
+        def fake(query, params=None, fetch_one=False, fetch_all=False, commit=False, **kw):
+            calls.append((query, params))
+            if "SELECT role_id FROM roles WHERE role_name" in query:
+                return {"role_id": 9}
+            if query.strip().startswith("UPDATE users"):
+                return 1
+            raise AssertionError(f"Unexpected query: {query}")
+
+        _auth_module.execute_query = fake
+        ok, msg = _auth_module.update_user(5, "  新名字  ", "  a@b.com ", "模具工")
+
+        assert ok is True
+        upd = [c for c in calls if c[0].strip().startswith("UPDATE users")][0]
+        assert "role_id = %s" in upd[0]
+        # 姓名/邮箱去空白；role_id 已解析；user_id 在末位
+        assert upd[1] == ("新名字", "a@b.com", 9, 5)
+
+    def test_empty_name_rejected(self):
+        ok, msg = _auth_module.update_user(5, "   ", "a@b.com", None)
+        assert ok is False
+        assert "姓名" in msg
+
+    def test_without_role_does_not_touch_role(self):
+        calls = []
+
+        def fake(query, params=None, **kw):
+            calls.append((query, params))
+            return 1
+
+        _auth_module.execute_query = fake
+        ok, msg = _auth_module.update_user(5, "名字", "", None)  # role 不传 → 不改角色
+
+        assert ok is True
+        upd = calls[-1]
+        assert "role_id" not in upd[0]
+        assert upd[1] == ("名字", None, 5)  # 空邮箱归一化为 None
+
+    def test_unknown_role_rejected(self):
+        def fake(query, params=None, fetch_one=False, **kw):
+            if "SELECT role_id FROM roles" in query:
+                return None  # 角色不存在
+            raise AssertionError("不应执行 UPDATE")
+
+        _auth_module.execute_query = fake
+        ok, msg = _auth_module.update_user(5, "名字", "a@b.com", "不存在的角色")
+        assert ok is False
+        assert "角色" in msg
