@@ -2,14 +2,22 @@
 
 import streamlit as st
 import bcrypt
-from utils.database import execute_query
+import functools
+import sqlite3
+from utils.database import execute_query, check_table_exists
 import logging
 import json
-import re  # 用于密码复杂度验证
-import time  # 用于登录尝试延迟
+import re
+from datetime import datetime, timedelta
 
-# 配置日志，与database.py统一
-logging.basicConfig(level=logging.INFO)
+try:
+    from config.settings import (
+        LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_SECONDS, PASSWORD_MIN_LENGTH
+    )
+except ImportError:
+    LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_SECONDS, PASSWORD_MIN_LENGTH = 5, 300, 8
+
+# 日志：库模块只取 logger，全局配置交给入口 main.py
 logger = logging.getLogger(__name__)
 
 # 角色权限映射（保持硬编码，未来可移到DB）
@@ -67,7 +75,7 @@ def check_password(username: str, password: str):
                     role_result = execute_query(role_query, params=(user['role_id'],), fetch_one=True)
                     if role_result:
                         role_name = role_result['role_name']
-                except Exception as e:
+                except sqlite3.Error as e:
                     logger.error(f"获取角色失败: {e}")
                     return None  # 失败不登录
             
@@ -86,7 +94,7 @@ def check_password(username: str, password: str):
             logger.warning(f"密码验证失败: {username}")
             return None
             
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"登录查询错误: {e}")
         return None
 
@@ -103,46 +111,92 @@ def has_permission(permission: str) -> bool:
     
     return permission in permissions
 
+_LOCK_TIME_FMT = '%Y-%m-%d %H:%M:%S'
+
+def _get_lockout_record(username: str):
+    """读取某用户名的失败计数/锁定记录。"""
+    try:
+        return execute_query(
+            "SELECT attempts, locked_until FROM login_attempts WHERE username = %s",
+            params=(username,), fetch_one=True
+        )
+    except sqlite3.Error as e:
+        logger.error(f"读取登录锁定记录失败: {e}")
+        return None
+
+def _is_locked(record) -> bool:
+    """根据记录判断账号是否仍在锁定时段内。"""
+    if not record or not record.get('locked_until'):
+        return False
+    try:
+        locked_until = datetime.strptime(record['locked_until'], _LOCK_TIME_FMT)
+    except (ValueError, TypeError):
+        return False
+    return datetime.now() < locked_until
+
+def _register_failed_attempt(username: str) -> None:
+    """登录失败：服务端累加计数，达阈值则写入锁定截止时间。"""
+    record = _get_lockout_record(username)
+    attempts = (record['attempts'] if record else 0) + 1
+    locked_until = None
+    if attempts >= LOGIN_MAX_ATTEMPTS:
+        locked_until = (datetime.now() + timedelta(seconds=LOGIN_LOCKOUT_SECONDS)).strftime(_LOCK_TIME_FMT)
+    now = datetime.now().strftime(_LOCK_TIME_FMT)
+    try:
+        execute_query(
+            """
+            INSERT INTO login_attempts (username, attempts, last_attempt, locked_until)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT(username) DO UPDATE SET
+                attempts     = excluded.attempts,
+                last_attempt = excluded.last_attempt,
+                locked_until = excluded.locked_until
+            """,
+            params=(username, attempts, now, locked_until), commit=True
+        )
+    except sqlite3.Error as e:
+        logger.error(f"写入登录失败计数失败: {e}")
+
+def _reset_attempts(username: str) -> None:
+    """登录成功：清除该用户名的失败计数。"""
+    try:
+        execute_query(
+            "DELETE FROM login_attempts WHERE username = %s",
+            params=(username,), commit=True
+        )
+    except sqlite3.Error as e:
+        logger.error(f"清除登录失败计数失败: {e}")
+
 def login_user(username: str, password: str):
-    """用户登录 - 加尝试限制"""
-    if 'login_attempts' not in st.session_state:
-        st.session_state['login_attempts'] = 0
-        st.session_state['last_attempt_time'] = time.time()
-    
-    # 检查锁定
-    if st.session_state['login_attempts'] >= 5:
-        if time.time() - st.session_state['last_attempt_time'] < 300:  # 5分钟锁定
-            logger.warning(f"登录尝试过多，锁定: {username}")
-            return None
-        else:
-            # 超时重置
-            st.session_state['login_attempts'] = 0
-    
+    """用户登录 - 服务端失败计数与锁定（基于 DB，清除会话无法绕过）"""
+    # 服务端锁定检查
+    if _is_locked(_get_lockout_record(username)):
+        logger.warning(f"账号锁定中，拒绝登录: {username}")
+        return None
+
     user_info = check_password(username, password)
-    
+
     if user_info:
         logger.info(f"登录成功: {username}")
+        # 重置失败计数
+        _reset_attempts(username)
         # 设置会话
         st.session_state['logged_in'] = True
         st.session_state['user_id'] = user_info['user_id']
         st.session_state['username'] = user_info['username']
         st.session_state['full_name'] = user_info.get('full_name', user_info['username'])
         st.session_state['user_role'] = user_info['role']
-        
-        # 重置尝试
-        st.session_state['login_attempts'] = 0
-        
+
         # 记录日志
         try:
             log_user_action('LOGIN', 'system', username)
         except Exception as e:
             logger.error(f"记录登录日志失败: {e}")
-        
+
         return user_info
     else:
-        st.session_state['login_attempts'] += 1
-        st.session_state['last_attempt_time'] = time.time()
-        logger.warning(f"登录失败: {username}，尝试次数: {st.session_state['login_attempts']}")
+        _register_failed_attempt(username)
+        logger.warning(f"登录失败: {username}")
         return None
 
 def logout_user():
@@ -169,21 +223,13 @@ def log_user_action(action_type: str, target_resource: str,
     
     try:
         # 检查表存在
-        check_query = """
-        SELECT EXISTS (
-            SELECT 1 FROM information_schema.tables 
-            WHERE table_name = 'system_logs'
-        )
-        """
-        
-        table_exists = execute_query(check_query, fetch_one=True)
-        if not table_exists or not table_exists.get('exists'):
+        if not check_table_exists('system_logs'):
             logger.warning("system_logs表不存在，跳过日志记录")
             return
-        
+
         # 记录日志
         query = """
-        INSERT INTO system_logs (user_id, action_type, target_resource, 
+        INSERT INTO system_logs (user_id, action_type, target_resource,
                                  target_id, details, timestamp)
         VALUES (%s, %s, %s, %s, %s, NOW())
         """
@@ -222,7 +268,7 @@ def get_all_users(offset: int = 0, limit: int = 100):
         result = execute_query(query, params=(limit, offset), fetch_all=True)
         logger.info(f"获取用户列表成功，共 {len(result) if result else 0} 个用户")
         return result or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取用户列表失败: {e}")
         return []
 
@@ -236,9 +282,15 @@ def create_user(username: str, password: str, full_name: str,
     if existing:
         return False, "用户名已存在"
     
-    # 获取role_id
-    role_query = "SELECT role_id FROM roles WHERE role_name = %s"
-    role_result = execute_query(role_query, params=(role_name,), fetch_one=True)
+    # 获取 role_id。兼容传入 role_name 或 role_id
+    if isinstance(role_name, int) or (isinstance(role_name, str) and role_name.isdigit()):
+        role_query = "SELECT role_id FROM roles WHERE role_id = %s"
+        role_lookup_value = int(role_name)
+    else:
+        role_query = "SELECT role_id FROM roles WHERE role_name = %s"
+        role_lookup_value = role_name
+
+    role_result = execute_query(role_query, params=(role_lookup_value,), fetch_one=True)
     
     if not role_result:
         return False, f"角色 '{role_name}' 不存在"
@@ -267,7 +319,7 @@ def create_user(username: str, password: str, full_name: str,
             return True, "用户创建成功"
         else:
             return False, "用户创建失败"
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"创建用户失败: {e}")
         return False, f"创建失败: {str(e)}"
 
@@ -281,47 +333,40 @@ def update_user_status(user_id: int, is_active: bool):
             return True, f"用户已{status_text}"
         else:
             return False, "用户不存在"
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"更新用户状态失败: {e}")
         return False, f"更新失败: {str(e)}"
 
 def get_user_activity_log(user_id=None, days=7):
     """获取用户活动日志"""
     try:
-        check_query = """
-        SELECT EXISTS (
-            SELECT 1 FROM information_schema.tables 
-            WHERE table_name = 'system_logs'
-        )
-        """
-        
-        table_exists = execute_query(check_query, fetch_one=True)
-        if not table_exists or not table_exists.get('exists'):
+        if not check_table_exists('system_logs'):
             return []
-        
+
+        cutoff = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
         if user_id:
             query = """
             SELECT sl.*, u.username, u.full_name
             FROM system_logs sl
             JOIN users u ON sl.user_id = u.user_id
-            WHERE sl.user_id = %s AND sl.timestamp >= NOW() - INTERVAL '%s days'
+            WHERE sl.user_id = %s AND sl.timestamp >= %s
             ORDER BY sl.timestamp DESC
             LIMIT 100
             """
-            params = (user_id, days)
+            params = (user_id, cutoff)
         else:
             query = """
             SELECT sl.*, u.username, u.full_name
             FROM system_logs sl
             JOIN users u ON sl.user_id = u.user_id
-            WHERE sl.timestamp >= NOW() - INTERVAL '%s days'
+            WHERE sl.timestamp >= %s
             ORDER BY sl.timestamp DESC
             LIMIT 100
             """
-            params = (days,)
+            params = (cutoff,)
         
         return execute_query(query, params=params, fetch_all=True) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取活动日志失败: {e}")
         return []
 
@@ -332,14 +377,14 @@ def get_all_roles():
         result = execute_query(query, fetch_all=True)
         logger.info(f"获取角色列表成功，共 {len(result) if result else 0} 个角色")
         return result or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取角色列表失败: {e}")
         return []
 
 def validate_password_strength(password: str):
     """验证密码强度 - 增强版"""
-    if len(password) < 8:
-        return False, "密码长度至少8位"
+    if len(password) < PASSWORD_MIN_LENGTH:
+        return False, f"密码长度至少{PASSWORD_MIN_LENGTH}位"
     if not re.search(r'[A-Z]', password):
         return False, "密码必须包含大写字母"
     if not re.search(r'[a-z]', password):
@@ -352,3 +397,44 @@ def get_user_permissions():
     """获取当前用户的权限列表"""
     user_role = st.session_state.get('user_role', '')
     return ROLE_PERMISSIONS.get(user_role, [])
+
+def require_permission(permission: str):
+    """页面级权限装饰器，用于保护 show() 函数"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not st.session_state.get('logged_in', False):
+                st.error("🔒 请先登录以访问此页面。")
+                st.stop()
+                return
+            if not has_permission(permission):
+                user_role = st.session_state.get('user_role', '未知角色')
+                st.error(f"❌ 权限不足：您的角色（{user_role}）无法访问此功能。")
+                st.stop()
+                return
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def update_user_password(user_id: int, new_password: str):
+    """更新用户密码"""
+    is_valid, msg = validate_password_strength(new_password)
+    if not is_valid:
+        return False, msg
+
+    password_hash = bcrypt.hashpw(
+        new_password.encode('utf-8'),
+        bcrypt.gensalt()
+    ).decode('utf-8')
+
+    query = "UPDATE users SET password_hash = %s, updated_at = NOW() WHERE user_id = %s"
+    try:
+        rowcount = execute_query(query, params=(password_hash, user_id), commit=True)
+        if rowcount and rowcount > 0:
+            logger.info(f"密码更新成功: user_id={user_id}")
+            return True, "密码更新成功"
+        else:
+            return False, "用户不存在"
+    except sqlite3.Error as e:
+        logger.error(f"更新密码失败: {e}")
+        return False, f"更新失败: {str(e)}"

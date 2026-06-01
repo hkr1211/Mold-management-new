@@ -3,38 +3,19 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import sqlite3
 from datetime import datetime, timedelta
 from utils.database import execute_query
 from utils.auth import require_permission
+from utils.ui import inject_global_css, page_header
+from utils.nav import setup_sidebar
 
 @require_permission('view_reports')
 def show():
     """成本分析主页面"""
-    st.title("💰 成本分析仪表板")
-    
-    # 添加自定义样式
-    st.markdown("""
-    <style>
-        .cost-metric {
-            background: linear-gradient(135deg, #FF6B6B 0%, #FF8787 100%);
-            color: white;
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            font-size: 24px;
-            font-weight: bold;
-        }
-        .saving-metric {
-            background: linear-gradient(135deg, #4ECDC4 0%, #6EE7E0 100%);
-            color: white;
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            font-size: 24px;
-            font-weight: bold;
-        }
-    </style>
-    """, unsafe_allow_html=True)
+    inject_global_css()
+    setup_sidebar("7_成本分析.py")
+    page_header("💰", "成本分析仪表板", "维修成本 · 趋势分析 · 优化建议")
     
     # 时间范围选择
     col1, col2, col3 = st.columns([2, 2, 1])
@@ -532,37 +513,47 @@ def get_cost_summary(start_date, end_date):
         'avg_change': -10.1
     }
 
-def get_cost_trend_data(start_date, end_date):
-    """获取成本趋势数据"""
-    query = """
-    SELECT 
-        DATE_TRUNC('day', cost_date) as date,
+
+def _build_cost_trend_query():
+    """构建兼容 SQLite 的成本趋势查询"""
+    return """
+    SELECT
+        strftime('%Y-%m-%d', record_date) as date,
         SUM(CASE WHEN cost_type = '维修成本' THEN amount ELSE 0 END) as maintenance_cost,
         SUM(CASE WHEN cost_type = '停机损失' THEN amount ELSE 0 END) as downtime_cost,
         SUM(amount) as total_cost
     FROM cost_records
-    WHERE cost_date BETWEEN %s AND %s
-    GROUP BY DATE_TRUNC('day', cost_date)
+    WHERE record_date BETWEEN %s AND %s
+    GROUP BY strftime('%Y-%m-%d', record_date)
     ORDER BY date
     """
+
+
+def _build_cost_composition_query():
+    """构建兼容当前 SQLite schema 的成本构成查询"""
+    return """
+    SELECT
+        cost_type,
+        SUM(amount) as total_amount
+    FROM cost_records
+    WHERE record_date BETWEEN %s AND %s
+    GROUP BY cost_type
+    """
+
+def get_cost_trend_data(start_date, end_date):
+    """获取成本趋势数据"""
+    query = _build_cost_trend_query()
     
     try:
         results = execute_query(query, params=(start_date, end_date), fetch_all=True)
         return [dict(r) for r in results] if results else []
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取趋势数据失败: {e}")
         return []
 
 def get_cost_composition(start_date, end_date):
     """获取成本构成"""
-    query = """
-    SELECT 
-        cost_type,
-        SUM(amount) as total_amount
-    FROM cost_records
-    WHERE cost_date BETWEEN %s AND %s
-    GROUP BY cost_type
-    """
+    query = _build_cost_composition_query()
     
     try:
         results = execute_query(query, params=(start_date, end_date), fetch_all=True)
@@ -583,7 +574,7 @@ def get_cost_composition(start_date, end_date):
                 ]
             }
         return {'names': [], 'values': [], 'changes': []}
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取成本构成失败: {e}")
         return {'names': [], 'values': [], 'changes': []}
 
@@ -728,12 +719,4 @@ def save_cost_targets(maintenance_target, downtime_target):
     log_user_action('SET_COST_TARGET', 'cost_management', 
                    f"maintenance:{maintenance_target},downtime:{downtime_target}")
 
-if __name__ == "__main__":
-    # 模拟登录状态用于测试
-    if 'logged_in' not in st.session_state:
-        st.session_state['logged_in'] = True
-        st.session_state['user_id'] = 1
-        st.session_state['user_role'] = '模具库管理员'
-        st.session_state['username'] = 'test_admin'
-    
-    show()
+show()

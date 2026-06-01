@@ -14,67 +14,31 @@ import psutil
 import numpy as np
 import os
 import logging
+import sqlite3
 from utils.auth import (
     has_permission, get_all_users, create_user, update_user_status,
     get_user_activity_log, get_all_roles, validate_password_strength,
     update_user_password, log_user_action
 )
 from utils.database import execute_query, test_connection
+from utils.ui import inject_global_css, page_header
+from utils.nav import setup_sidebar
 
 def show():
     """系统管理主页面"""
-    st.title("⚙️ 系统管理")
-    
+    inject_global_css()
+
+    if not st.session_state.get('logged_in'):
+        st.error("🔒 请先登录以访问此页面。")
+        st.stop()
+
     # 权限检查
     if st.session_state.get('user_role') != '超级管理员':
         st.error("❌ 权限不足：仅超级管理员可以访问系统管理功能")
         return
-    
-    # 添加自定义样式
-    st.markdown("""
-    <style>
-        .system-metric {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        .config-item {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 8px;
-            margin: 10px 0;
-            border-left: 3px solid #1f77b4;
-        }
-        .status-ok { color: #4caf50; }
-        .status-warning { color: #ff9800; }
-        .status-error { color: #f44336; }
-        .user-card {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            margin: 10px 0;
-            border-left: 4px solid #1f77b4;
-        }
-        .status-active { color: #4caf50; font-weight: bold; }
-        .status-inactive { color: #f44336; font-weight: bold; }
-        .role-badge {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 14px;
-            font-weight: bold;
-            margin: 2px;
-        }
-        .role-admin { background: #e3f2fd; color: #1976d2; }
-        .role-manager { background: #f3e5f5; color: #7b1fa2; }
-        .role-technician { background: #e8f5e9; color: #388e3c; }
-        .role-operator { background: #fff3e0; color: #f57c00; }
-    </style>
-    """, unsafe_allow_html=True)
+
+    setup_sidebar("5_系统管理.py")
+    page_header("⚙️", "系统管理", "用户管理 · 系统配置 · 系统监控")
     
     # 主导航标签
     tab1, tab2, tab3 = st.tabs(["👥 用户管理", "🔧 系统配置", "📊 系统监控"])
@@ -154,7 +118,7 @@ def show_user_list():
             if st.button("重试获取数据"):
                 st.rerun()
             return
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取用户列表时出错: {str(e)}")
         if st.button("重试获取数据"):
             st.rerun()
@@ -211,6 +175,13 @@ def display_user_card(user):
     """显示用户卡片"""
     status_class = "status-active" if user['is_active'] else "status-inactive"
     status_text = "✅ 启用" if user['is_active'] else "❌ 禁用"
+    created_at = user.get('created_at')
+    if hasattr(created_at, 'strftime'):
+        created_at_text = created_at.strftime('%Y-%m-%d')
+    elif created_at:
+        created_at_text = str(created_at)[:10]
+    else:
+        created_at_text = '未知'
     
     # 角色样式映射
     role_style_map = {
@@ -229,7 +200,7 @@ def display_user_card(user):
         <p><strong>角色:</strong> <span class="role-badge {role_class}">{user['role_name']}</span></p>
         <p><strong>状态:</strong> <span class="{status_class}">{status_text}</span></p>
         <p><strong>邮箱:</strong> {user.get('email', '未设置')}</p>
-        <p><strong>创建时间:</strong> {user['created_at'].strftime('%Y-%m-%d')}</p>
+        <p><strong>创建时间:</strong> {created_at_text}</p>
     </div>
     """
     st.markdown(card_html, unsafe_allow_html=True)
@@ -266,6 +237,49 @@ def display_user_card(user):
         if st.button(f"📊 日志", key=f"logs_{user['user_id']}"):
             st.session_state['view_user_logs'] = user['user_id']
             st.rerun()
+
+
+def _normalize_optional_text(value):
+    """将可选文本字段统一做去空白处理；空串返回 None。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _validate_create_user_form(username, full_name, password, password_confirm, email, existing_users):
+    """校验新增用户表单，并返回清洗后的输入。"""
+    cleaned = {
+        'username': (username or '').strip(),
+        'full_name': (full_name or '').strip(),
+        'password': password or '',
+        'password_confirm': password_confirm or '',
+        'email': _normalize_optional_text(email),
+    }
+
+    errors = []
+
+    if not all([cleaned['username'], cleaned['full_name'], cleaned['password'], cleaned['password_confirm']]):
+        errors.append("请填写所有必填字段")
+
+    if cleaned['username'] and not cleaned['username'].replace('_', '').isalnum():
+        errors.append("用户名只能包含字母、数字和下划线")
+
+    if any(u['username'] == cleaned['username'] for u in existing_users):
+        errors.append(f"用户名 '{cleaned['username']}' 已存在，请选择其他用户名")
+
+    if cleaned['password'] != cleaned['password_confirm']:
+        errors.append("两次输入的密码不一致")
+
+    if cleaned['password']:
+        is_valid, msg = validate_password_strength(cleaned['password'])
+        if not is_valid:
+            errors.append(msg)
+
+    if cleaned['email'] and '@' not in cleaned['email']:
+        errors.append("邮箱格式不正确")
+
+    return errors, cleaned
 
 def show_create_user():
     """新增用户界面 - 增强版"""
@@ -338,34 +352,15 @@ def show_create_user():
                 st.rerun()
         
         if submitted and role_id:
-            # 验证输入
-            errors = []
-            
-            # 基础验证
-            if not all([username, full_name, password, password_confirm]):
-                errors.append("请填写所有必填字段")
-            
-            # 用户名格式验证
-            if username and not username.replace('_', '').isalnum():
-                errors.append("用户名只能包含字母、数字和下划线")
-            
-            # 检查用户名是否重复
             existing_users = get_all_users()
-            if any(u['username'] == username for u in existing_users):
-                errors.append(f"用户名 '{username}' 已存在，请选择其他用户名")
-            
-            # 密码验证
-            if password != password_confirm:
-                errors.append("两次输入的密码不一致")
-            
-            if password:
-                is_valid, msg = validate_password_strength(password)
-                if not is_valid:
-                    errors.append(msg)
-            
-            # 邮箱格式验证
-            if email and '@' not in email:
-                errors.append("邮箱格式不正确")
+            errors, cleaned = _validate_create_user_form(
+                username=username,
+                full_name=full_name,
+                password=password,
+                password_confirm=password_confirm,
+                email=email,
+                existing_users=existing_users
+            )
             
             if errors:
                 for error in errors:
@@ -373,25 +368,31 @@ def show_create_user():
             else:
                 # 创建用户
                 with st.spinner("正在创建用户..."):
-                    success, msg = create_user(username, password, full_name, role_id, email)
+                    success, msg = create_user(
+                        cleaned['username'],
+                        cleaned['password'],
+                        cleaned['full_name'],
+                        role_id,
+                        cleaned['email']
+                    )
                     
                 if success:
                     st.success(f"✅ {msg}")
                     st.balloons()
                     
                     # 记录操作日志
-                    log_user_action('CREATE_USER', 'users', username, {
-                        'full_name': full_name,
+                    log_user_action('CREATE_USER', 'users', cleaned['username'], {
+                        'full_name': cleaned['full_name'],
                         'role_id': role_id,
-                        'email': email
+                        'email': cleaned['email']
                     })
                     
                     # 模拟发送邮件
-                    if send_email and email:
-                        st.info(f"📧 欢迎邮件已发送至 {email}")
+                    if send_email and cleaned['email']:
+                        st.info(f"📧 欢迎邮件已发送至 {cleaned['email']}")
                     
                     # 设置高亮显示标记
-                    st.session_state['show_new_user'] = username
+                    st.session_state['show_new_user'] = cleaned['username']
                     
                     # 延迟后刷新页面
                     import time
@@ -529,6 +530,13 @@ def show_activity_logs():
         user_id = None if user_filter == "全部" else user_filter[0]
     
     logs = get_user_activity_log(user_id, days)
+
+    def _to_date(value):
+        if hasattr(value, 'date'):
+            return value.date()
+        if value:
+            return pd.to_datetime(value).date()
+        return None
     
     # 应用操作类型筛选
     if action_filter != '全部' and logs:
@@ -555,7 +563,7 @@ def show_activity_logs():
             st.metric("登录次数", login_count)
         with col4:
             today = datetime.now().date()
-            today_logs = [log for log in logs if log['timestamp'].date() == today]
+            today_logs = [log for log in logs if _to_date(log.get('timestamp')) == today]
             st.metric("今日操作", len(today_logs))
     
     st.markdown("---")
@@ -1222,7 +1230,7 @@ def create_performance_chart(metric_type, time_range):
     import numpy as np
     
     hours = 24 if "24小时" in time_range else 168 if "7天" in time_range else 1
-    x = pd.date_range(end=datetime.now(), periods=hours, freq='H')
+    x = pd.date_range(end=datetime.now(), periods=hours, freq='h')
     y = np.random.randint(20, 80, size=hours) + np.sin(np.arange(hours) * 0.1) * 10
     
     fig = go.Figure()
@@ -1262,7 +1270,7 @@ def get_error_logs(level, module, days):
             "模块": "数据库",
             "用户": "mold_admin",
             "错误信息": "数据库连接超时",
-            "堆栈跟踪": "psycopg2.OperationalError: could not connect to server..."
+            "堆栈跟踪": "sqlite3.OperationalError: database is locked..."
         },
         {
             "时间": "2024-06-12 13:15:10",
@@ -1296,7 +1304,7 @@ def get_total_count(table_name):
         query = f"SELECT COUNT(*) as count FROM {table_name}"
         result = execute_query(query, fetch_one=True)
         return result['count'] if result else 0
-    except:
+    except sqlite3.Error:
         return 0
 
 def create_growth_trend_chart():
@@ -1493,12 +1501,5 @@ def verify_create_user_function():
                 st.error(f"测试创建用户时出错: {str(e)}")
 
 # 主函数
-if __name__ == "__main__":
-    # 模拟登录状态
-    if 'logged_in' not in st.session_state:
-        st.session_state['logged_in'] = True
-        st.session_state['user_id'] = 1
-        st.session_state['user_role'] = '超级管理员'
-        st.session_state['username'] = 'admin'
-    
-    show()
+# 访问控制由 show() 顶部统一处理（未登录 -> st.stop；非超级管理员 -> return）
+show()

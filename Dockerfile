@@ -17,8 +17,7 @@ COPY requirements.txt .
 # 安装Python依赖
 RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.txt
 
-# 复制项目中的所有文件到工作目录
-# 这是最关键的一步，它会把 alembic.ini, alembic/, app/, .env 等所有东西都复制进去
+# 复制项目中的所有文件到工作目录（app/、sql/、scripts/ 等）
 COPY . .
 
 # 暴露Streamlit应用端口

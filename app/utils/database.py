@@ -1,143 +1,79 @@
-# utils/database.py - 完整修复版数据库连接系统
+# app/utils/database.py — SQLite 本地数据库版
 import os
-import psycopg2
-import psycopg2.extras
-import psycopg2.pool
+import sqlite3
+import threading
 import streamlit as st
 import logging
+import re as _re
 import numpy as np
 from contextlib import contextmanager
 from typing import List, Dict, Any, Optional, Union, Tuple
-import json
 from datetime import datetime, date
 from decimal import Decimal
-import time  # 用于重试延迟
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
+try:
+    from config.settings import (
+        DB_PATH, CACHE_TTL_SECONDS, LOOKUP_CACHE_TTL, DEFAULT_PAGE_SIZE
+    )
+except ImportError:
+    _default_db = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'mold_management.db')
+    DB_PATH = os.getenv('SQLITE_DB_PATH', os.path.abspath(_default_db))
+    CACHE_TTL_SECONDS = 300
+    LOOKUP_CACHE_TTL = 600
+    DEFAULT_PAGE_SIZE = 100
+
+# 日志：库模块只取 logger，全局配置交给入口 main.py
 logger = logging.getLogger(__name__)
 
-# ========== 数据库配置 ==========
+# ── 连接管理（每线程独立连接 + WAL 模式）────────────────────────────
+_local = threading.local()
 
-def get_db_config() -> Dict[str, str]:
-    """获取数据库配置"""
-    config = {
-        'host': os.getenv('POSTGRES_HOST', 'localhost'),
-        'port': os.getenv('POSTGRES_PORT', '5432'),
-        'database': os.getenv('POSTGRES_DB', 'mold_management'),
-        'user': os.getenv('POSTGRES_USER', 'postgres'),
-        'password': os.getenv('POSTGRES_PASSWORD')  # 无默认，确保env设置
-    }
-    # 验证必需配置
-    if not config['password']:
-        raise ValueError("Missing POSTGRES_PASSWORD in environment variables")
-    return config
+def _get_conn() -> sqlite3.Connection:
+    conn = getattr(_local, 'conn', None)
+    if conn is None:
+        db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+        os.makedirs(db_dir, exist_ok=True)
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False,
+                               detect_types=sqlite3.PARSE_DECLTYPES)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA foreign_keys=ON')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        _local.conn = conn
+    return conn
 
-# 全局连接池
-_connection_pool = None
+# ── SQL 方言转换（PostgreSQL → SQLite）──────────────────────────────
+# 匹配单引号字符串字面量（含 '' 转义），用于在做按词替换前保护其内容。
+_STRING_LITERAL_RE = _re.compile(r"'(?:[^']|'')*'")
+_PLACEHOLDER_RE = _re.compile(r'\x00(\d+)\x00')
 
-def init_connection_pool():
-    """初始化连接池，支持SSL和重试"""
-    global _connection_pool
-    
-    try:
-        if _connection_pool is None:
-            config = get_db_config()
-            pool_args = {
-                'host': config['host'],
-                'port': config['port'],
-                'database': config['database'],
-                'user': config['user'],
-                'password': config['password'],
-                'cursor_factory': psycopg2.extras.RealDictCursor
-            }
-            # 加SSL配置
-            if os.getenv('DB_SSL', 'false') == 'true':
-                pool_args['sslmode'] = 'require'
-            else:
-                pool_args['sslmode'] = 'prefer'
-            
-            _connection_pool = psycopg2.pool.ThreadedConnectionPool(
-                2, 20,  # 调整min=2, max=20以适应负载
-                **pool_args
-            )
-            logger.info("数据库连接池初始化成功")
-    except Exception as e:
-        logger.error(f"数据库连接池初始化失败: {e}")
-        _connection_pool = None
-        # 重试机制：等待2s后重试一次
-        time.sleep(2)
-        try:
-            _connection_pool = psycopg2.pool.ThreadedConnectionPool(
-                2, 20, 
-                **pool_args
-            )
-            logger.info("连接池重试初始化成功")
-        except:
-            raise
+def _normalize_sql(sql: str) -> str:
+    # 结构性替换：作用于 SQL 语法 token，需要原始字面量（如 DATE_TRUNC 的 'month'），在保护前完成。
+    sql = sql.replace('%s', '?')
+    sql = _re.sub(r'\bNOW\s*\(\)', "datetime('now')", sql, flags=_re.IGNORECASE)
+    sql = _re.sub(r'\bCURRENT_TIMESTAMP\b', "datetime('now')", sql, flags=_re.IGNORECASE)
+    sql = _re.sub(
+        r"DATE_TRUNC\s*\(\s*'month'\s*,\s*CURRENT_DATE\s*\)",
+        "date('now','start of month')",
+        sql, flags=_re.IGNORECASE
+    )
 
-def get_connection():
-    """从连接池获取连接"""
-    global _connection_pool
-    
-    if _connection_pool is None:
-        init_connection_pool()
-    
-    try:
-        if _connection_pool:
-            return _connection_pool.getconn()
-        else:
-            # 备用直接连接
-            config = get_db_config()
-            pool_args = {
-                'host': config['host'],
-                'port': config['port'],
-                'database': config['database'],
-                'user': config['user'],
-                'password': config['password'],
-                'cursor_factory': psycopg2.extras.RealDictCursor
-            }
-            if os.getenv('DB_SSL', 'false') == 'true':
-                pool_args['sslmode'] = 'require'
-            else:
-                pool_args['sslmode'] = 'prefer'
-            return psycopg2.connect(**pool_args)
-    except Exception as e:
-        logger.error(f"获取数据库连接失败: {e}")
-        raise
+    # 把字符串字面量挖出占位，避免 ILIKE/true/false 的按词替换误伤其中的用户数据。
+    literals: list = []
+    def _stash(m):
+        literals.append(m.group(0))
+        return f"\x00{len(literals) - 1}\x00"
+    sql = _STRING_LITERAL_RE.sub(_stash, sql)
 
-def return_connection(conn):
-    """归还连接到连接池"""
-    global _connection_pool
-    
-    try:
-        if _connection_pool and conn:
-            _connection_pool.putconn(conn)
-        elif conn:
-            conn.close()
-    except Exception as e:
-        logger.error(f"归还连接失败: {e}")
+    sql = _re.sub(r'\bILIKE\b', 'LIKE', sql, flags=_re.IGNORECASE)
+    sql = _re.sub(r'\btrue\b', '1', sql, flags=_re.IGNORECASE)
+    sql = _re.sub(r'\bfalse\b', '0', sql, flags=_re.IGNORECASE)
 
-@contextmanager
-def get_db_connection():
-    """数据库连接上下文管理器"""
-    conn = None
-    try:
-        conn = get_connection()
-        yield conn
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"数据库操作异常: {e}")
-        raise
-    finally:
-        if conn:
-            return_connection(conn)
+    # 还原被保护的字面量
+    return _PLACEHOLDER_RE.sub(lambda m: literals[int(m.group(1))], sql)
 
-# ========== 数据类型转换 ==========
-
+# ── 数据类型转换 ─────────────────────────────────────────────────────
 def convert_numpy_types(obj):
-    """转换numpy类型为Python原生类型"""
     if isinstance(obj, np.integer):
         return int(obj)
     elif isinstance(obj, np.floating):
@@ -149,421 +85,450 @@ def convert_numpy_types(obj):
     elif isinstance(obj, Decimal):
         return float(obj)
     elif isinstance(obj, dict):
-        return {key: convert_numpy_types(value) for key, value in obj.items()}
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
     elif isinstance(obj, list):
-        return [convert_numpy_types(item) for item in obj]
-    else:
-        return obj
+        return [convert_numpy_types(i) for i in obj]
+    return obj
 
 def serialize_params(params):
-    """序列化查询参数"""
     if params is None:
         return None
-    
     if isinstance(params, (list, tuple)):
         return tuple(convert_numpy_types(p) for p in params)
-    else:
-        return convert_numpy_types(params)
+    return convert_numpy_types(params)
 
-# ========== 核心数据库操作函数 ==========
 
+class _CompatCursor:
+    """兼容旧 psycopg2 风格调用的轻量游标包装器"""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, query, params=None):
+        sql = _normalize_sql(query)
+        clean_params = serialize_params(params)
+        if clean_params is not None:
+            self._cursor.execute(
+                sql,
+                clean_params if isinstance(clean_params, tuple) else (clean_params,)
+            )
+        else:
+            self._cursor.execute(sql)
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _CompatConnection:
+    """兼容旧 psycopg2 风格调用的轻量连接包装器"""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.autocommit = True
+
+    def cursor(self):
+        return _CompatCursor(self._conn.cursor())
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self.rollback()
+        elif self.autocommit:
+            self.commit()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def get_db_connection():
+    """向旧页面暴露兼容的 DB 连接对象。"""
+    return _CompatConnection(_get_conn())
+
+# ── 核心查询函数 ─────────────────────────────────────────────────────
 def execute_query(
-    query: str, 
+    query: str,
     params: Optional[Union[List, Tuple, Dict]] = None,
     fetch_one: bool = False,
     fetch_all: bool = False,
-    commit: bool = False
+    commit: bool = False,
 ) -> Optional[Union[List[Dict], Dict, int]]:
-    """
-    执行数据库查询 - 修复版
-    
-    Args:
-        query: SQL查询语句
-        params: 查询参数
-        fetch_one: 是否返回单条记录
-        fetch_all: 是否返回所有记录
-        commit: 是否提交事务
-    
-    Returns:
-        查询结果、影响行数或None
-    """
-    conn = None
-    cursor = None
-    
+    clean_params = serialize_params(params)
+    sql = _normalize_sql(query)
+    conn = _get_conn()
+
     try:
-        # 序列化参数
-        clean_params = serialize_params(params)
-        
-        # 获取连接
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # 执行查询（加超时30s）
-        if clean_params:
-            cursor.execute(query, clean_params)
+        cur = conn.cursor()
+        if clean_params is not None:
+            cur.execute(sql, clean_params if isinstance(clean_params, tuple) else (clean_params,))
         else:
-            cursor.execute(query)
-        
-        # 处理结果
-        result = None
-        
+            cur.execute(sql)
+
         if fetch_one:
-            row = cursor.fetchone()
+            row = cur.fetchone()
             result = dict(row) if row else None
         elif fetch_all:
-            rows = cursor.fetchall()
-            result = [dict(row) for row in rows] if rows else []
+            rows = cur.fetchall()
+            result = [dict(r) for r in rows] if rows else []
         else:
-            # 对于DML，返回影响行数
-            result = cursor.rowcount
-        
-        # 提交事务
+            result = cur.rowcount
+
         if commit:
             conn.commit()
-            logger.debug(f"事务已提交: {query[:50]}... 影响行数: {cursor.rowcount}")
-        
-        # 转换数据类型
-        if result:
-            result = convert_numpy_types(result)
-        
-        return result
-        
-    except psycopg2.Error as e:
+            logger.debug(f"事务已提交，影响行数: {cur.rowcount}")
+
+        return convert_numpy_types(result) if result else result
+
+    except sqlite3.Error as e:
         logger.error(f"数据库错误: {e}")
-        logger.error(f"查询语句: {query}")
-        logger.error(f"参数: {params}")  # 注意：生产中mask敏感params
-        if conn:
-            conn.rollback()
+        logger.error(f"查询: {sql[:120]}")
+        logger.error(f"参数: <{len(params) if params else 0} 个值>")
+        conn.rollback()
         raise
-        
     except Exception as e:
-        logger.error(f"执行查询异常: {e}")
-        logger.error(f"查询语句: {query}")
-        if conn:
-            conn.rollback()
+        logger.error(f"查询异常: {e}")
+        conn.rollback()
         raise
-        
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            return_connection(conn)
 
 def test_connection() -> bool:
-    """测试数据库连接"""
     try:
-        result = execute_query("SELECT 1 as test", fetch_one=True)
+        result = execute_query("SELECT 1 AS test", fetch_one=True)
         return result is not None and result.get('test') == 1
     except Exception as e:
         logger.error(f"数据库连接测试失败: {e}")
         return False
 
 def get_table_info(table_name: str) -> List[Dict]:
-    """获取表结构信息"""
     try:
-        query = """
-        SELECT column_name, data_type, is_nullable, column_default
-        FROM information_schema.columns
-        WHERE table_name = %s AND table_schema = 'public'
-        ORDER BY ordinal_position
-        """
-        return execute_query(query, params=(table_name,), fetch_all=True) or []
-    except Exception as e:
+        _assert_safe_identifier(table_name, 'table')
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({table_name})")
+        return [dict(r) for r in cur.fetchall()]
+    except sqlite3.Error as e:
         logger.error(f"获取表 {table_name} 信息失败: {e}")
         return []
 
 def check_table_exists(table_name: str) -> bool:
-    """检查表是否存在"""
     try:
-        query = """
-        SELECT EXISTS (
-            SELECT FROM information_schema.tables 
-            WHERE table_schema = 'public' AND table_name = %s
+        result = execute_query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=%s",
+            params=(table_name,), fetch_one=True
         )
-        """
-        result = execute_query(query, params=(table_name,), fetch_one=True)
-        return result.get('exists', False) if result else False
+        return result is not None
     except Exception as e:
         logger.error(f"检查表 {table_name} 是否存在失败: {e}")
         return False
 
-# ========== 专用查询函数 ==========
-
-def get_all_molds(offset: int = 0, limit: int = 100) -> List[Dict]:
-    """获取所有模具信息，支持分页"""
+# ── 专用查询函数 ─────────────────────────────────────────────────────
+# 错误处理约定：只捕获 sqlite3.Error（数据库层故障，降级返回安全默认值，
+# 避免 UI 崩溃）；其余异常（非法表名/列名、类型错误等编码缺陷）一律向上
+# 抛出，绝不伪装成空数据静默吞掉。
+def get_all_molds(offset: int = 0, limit: int = DEFAULT_PAGE_SIZE) -> List[Dict]:
     try:
         query = """
-        SELECT 
-            m.mold_id,
-            m.mold_code,
-            m.mold_name,
-            m.mold_drawing_number,
-            mft.type_name as functional_type,
-            m.supplier,
-            m.manufacturing_date,
-            m.theoretical_lifespan_strokes,
-            m.accumulated_strokes,
+        SELECT
+            m.mold_id, m.mold_code, m.mold_name, m.mold_drawing_number,
+            mft.type_name  AS functional_type,
+            m.supplier, m.manufacturing_date,
+            m.theoretical_lifespan_strokes, m.accumulated_strokes,
             m.maintenance_cycle_strokes,
-            ms.status_name as current_status,
-            sl.location_name as current_location,
-            u.full_name as responsible_person,
-            m.remarks,
-            m.created_at,
-            m.updated_at
+            ms.status_name   AS current_status,
+            sl.location_name AS current_location,
+            u.full_name      AS responsible_person,
+            m.remarks, m.created_at, m.updated_at
         FROM molds m
         LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
-        LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
-        LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
-        LEFT JOIN users u ON m.responsible_person_id = u.user_id
+        LEFT JOIN mold_statuses ms          ON m.current_status_id        = ms.status_id
+        LEFT JOIN storage_locations sl      ON m.current_location_id      = sl.location_id
+        LEFT JOIN users u                   ON m.responsible_person_id    = u.user_id
         ORDER BY m.created_at DESC
         LIMIT %s OFFSET %s
         """
         return execute_query(query, params=(limit, offset), fetch_all=True) or []
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取模具列表失败: {e}")
         return []
 
 def get_mold_by_id(mold_id: int) -> Optional[Dict]:
-    """根据ID获取模具信息"""
     try:
         query = """
-        SELECT 
-            m.*,
-            mft.type_name as functional_type,
-            ms.status_name as current_status,
-            sl.location_name as current_location,
-            u.full_name as responsible_person
+        SELECT m.*,
+               mft.type_name  AS functional_type,
+               ms.status_name   AS current_status,
+               sl.location_name AS current_location,
+               u.full_name      AS responsible_person
         FROM molds m
         LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
-        LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
-        LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
-        LEFT JOIN users u ON m.responsible_person_id = u.user_id
+        LEFT JOIN mold_statuses ms          ON m.current_status_id        = ms.status_id
+        LEFT JOIN storage_locations sl      ON m.current_location_id      = sl.location_id
+        LEFT JOIN users u                   ON m.responsible_person_id    = u.user_id
         WHERE m.mold_id = %s
         """
         return execute_query(query, params=(mold_id,), fetch_one=True)
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"获取模具 {mold_id} 信息失败: {e}")
         return None
 
 def get_loan_statuses() -> List[Dict]:
-    """获取借用状态列表"""
     try:
-        query = "SELECT status_id, status_name, description FROM loan_statuses ORDER BY status_id"
-        return execute_query(query, fetch_all=True) or []
-    except Exception as e:
+        return execute_query(
+            "SELECT status_id, status_name, description FROM loan_statuses ORDER BY status_id",
+            fetch_all=True
+        ) or []
+    except sqlite3.Error as e:
         logger.error(f"获取借用状态失败: {e}")
         return []
 
 def get_mold_statuses() -> List[Dict]:
-    """获取模具状态列表"""
     try:
-        query = "SELECT status_id, status_name, description FROM mold_statuses ORDER BY status_id"
-        return execute_query(query, fetch_all=True) or []
-    except Exception as e:
+        return execute_query(
+            "SELECT status_id, status_name, description FROM mold_statuses ORDER BY status_id",
+            fetch_all=True
+        ) or []
+    except sqlite3.Error as e:
         logger.error(f"获取模具状态失败: {e}")
         return []
 
 def get_storage_locations() -> List[Dict]:
-    """获取存储位置列表"""
     try:
-        query = "SELECT location_id, location_name, description FROM storage_locations ORDER BY location_name"
-        return execute_query(query, fetch_all=True) or []
-    except Exception as e:
+        return execute_query(
+            "SELECT location_id, location_name, description FROM storage_locations ORDER BY location_name",
+            fetch_all=True
+        ) or []
+    except sqlite3.Error as e:
         logger.error(f"获取存储位置失败: {e}")
         return []
 
 def get_functional_types() -> List[Dict]:
-    """获取模具功能类型列表"""
     try:
-        query = "SELECT type_id, type_name, description FROM mold_functional_types ORDER BY type_name"
-        return execute_query(query, fetch_all=True) or []
-    except Exception as e:
+        return execute_query(
+            "SELECT type_id, type_name, description FROM mold_functional_types ORDER BY type_name",
+            fetch_all=True
+        ) or []
+    except sqlite3.Error as e:
         logger.error(f"获取功能类型失败: {e}")
         return []
 
-# ========== 数据验证函数 ==========
+# ── 标识符安全白名单 ─────────────────────────────────────────────────
+_ALLOWED_TABLES = {
+    'molds', 'users', 'roles',
+    'mold_loan_records', 'mold_maintenance_logs', 'mold_parts', 'mold_part_categories',
+    'system_logs', 'mold_statuses', 'loan_statuses', 'maintenance_result_statuses',
+    'maintenance_types', 'mold_functional_types', 'storage_locations',
+    'production_equipment', 'production_orders', 'production_schedules',
+    'mold_recommendations', 'cost_records', 'products',
+}
 
+_IDENTIFIER_RE = _re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+
+def _assert_safe_identifier(name: str, kind: str = 'identifier') -> None:
+    if not _IDENTIFIER_RE.match(name):
+        raise ValueError(f"非法 SQL {kind}：{name!r}")
+    if kind == 'table' and name not in _ALLOWED_TABLES:
+        raise ValueError(f"表名不在白名单中：{name!r}")
+
+def _get_primary_key(table: str) -> Optional[str]:
+    """通过 PRAGMA table_info 读取表的真实主键列名（不靠命名约定猜测）。"""
+    for col in get_table_info(table):
+        if col.get('pk'):
+            return col['name']
+    return None
+
+# ── 数据验证函数 ─────────────────────────────────────────────────────
 def validate_foreign_key(table: str, column: str, value: Any) -> bool:
-    """验证外键是否存在"""
     try:
+        _assert_safe_identifier(table, 'table')
+        _assert_safe_identifier(column, 'column')
         if value is None:
-            return True  # NULL值是允许的
-        
-        query = f"SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = %s)"
-        result = execute_query(query, params=(value,), fetch_one=True)
-        return result.get('exists', False) if result else False
-    except Exception as e:
-        logger.error(f"验证外键失败: {table}.{column} = {value}, 错误: {e}")
+            return True
+        result = execute_query(
+            f"SELECT 1 FROM {table} WHERE {column} = %s LIMIT 1",
+            params=(value,), fetch_one=True
+        )
+        return result is not None
+    except sqlite3.Error as e:
+        logger.error(f"验证外键失败: {table}.{column}={value}, 错误: {e}")
         return False
 
-def validate_unique_constraint(table: str, column: str, value: Any, exclude_id: Optional[int] = None) -> bool:
-    """验证唯一约束"""
+def validate_unique_constraint(table: str, column: str, value: Any,
+                               exclude_id: Optional[int] = None) -> bool:
     try:
-        query = f"SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = %s"
-        params = [value]
-        
-        if exclude_id:
-            # 假设主键为 {table[:-1]}_id
-            primary_key = f"{table[:-1]}_id"  
+        _assert_safe_identifier(table, 'table')
+        _assert_safe_identifier(column, 'column')
+
+        query = f"SELECT 1 FROM {table} WHERE {column} = %s"
+        params: list = [value]
+
+        if exclude_id is not None:
+            primary_key = _get_primary_key(table)
+            if not primary_key:
+                logger.error(f"无法确定表 {table} 的主键，跳过 exclude_id 过滤")
+                raise ValueError(f"表 {table} 无主键，无法按 exclude_id 排除")
+            _assert_safe_identifier(primary_key, 'column')
             query += f" AND {primary_key} != %s"
             params.append(exclude_id)
-        
-        query += ")"
-        
+
+        query += " LIMIT 1"
         result = execute_query(query, params=tuple(params), fetch_one=True)
-        exists = result.get('exists', False) if result else False
-        return not exists  # 不存在才表示唯一约束满足
-    except Exception as e:
-        logger.error(f"验证唯一约束失败: {table}.{column} = {value}, 错误: {e}")
+        return result is None  # 不存在才满足唯一约束
+    except sqlite3.Error as e:
+        logger.error(f"验证唯一约束失败: {table}.{column}={value}, 错误: {e}")
         return False
 
-# ========== 批量操作函数 ==========
-
+# ── 批量操作函数 ─────────────────────────────────────────────────────
 def bulk_insert(table: str, columns: List[str], data: List[List]) -> bool:
-    """批量插入数据"""
     if not data:
         return True
-    
-    conn = None
-    cursor = None
-    
+    _assert_safe_identifier(table, 'table')
+    for col in columns:
+        _assert_safe_identifier(col, 'column')
+
+    conn = _get_conn()
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
-        # 构建SQL语句
-        placeholders = ", ".join(["%s"] * len(columns))
+        placeholders = ', '.join(['?'] * len(columns))
         query = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
-        
-        # 执行批量插入
-        cursor.executemany(query, data)
+        conn.executemany(query, data)
         conn.commit()
-        
-        logger.info(f"批量插入成功: {table} - {len(data)} 条记录")
+        logger.info(f"批量插入成功: {table} — {len(data)} 条")
         return True
-        
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"批量插入失败: {e}")
-        if conn:
-            conn.rollback()
+        conn.rollback()
         return False
-        
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            return_connection(conn)
+    except Exception:
+        conn.rollback()  # 编码缺陷也先回滚事务，再上抛暴露
+        raise
 
 def bulk_update(table: str, updates: List[Dict]) -> bool:
-    """批量更新数据"""
     if not updates:
         return True
-    
-    conn = None
-    cursor = None
-    
+    _assert_safe_identifier(table, 'table')
+
+    conn = _get_conn()
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
+        cur = conn.cursor()
         for update in updates:
             if not update.get('set') or not update.get('where'):
                 continue
-            
-            set_clause = ", ".join([f"{k} = %s" for k in update['set'].keys()])
-            where_clause = " AND ".join([f"{k} = %s" for k in update['where'].keys()])
-            
+            for col in list(update['set'].keys()) + list(update['where'].keys()):
+                _assert_safe_identifier(col, 'column')
+            set_clause   = ', '.join([f"{k} = ?" for k in update['set'].keys()])
+            where_clause = ' AND '.join([f"{k} = ?" for k in update['where'].keys()])
             query = f"UPDATE {table} SET {set_clause} WHERE {where_clause}"
             params = list(update['set'].values()) + list(update['where'].values())
-            
-            cursor.execute(query, params)
-        
+            cur.execute(query, params)
         conn.commit()
-        logger.info(f"批量更新成功: {table} - {len(updates)} 条记录")
+        logger.info(f"批量更新成功: {table} — {len(updates)} 条")
         return True
-        
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"批量更新失败: {e}")
-        if conn:
-            conn.rollback()
+        conn.rollback()
         return False
-        
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            return_connection(conn)
+    except Exception:
+        conn.rollback()  # 编码缺陷也先回滚事务，再上抛暴露
+        raise
 
-# ========== 事务处理 ==========
-
+# ── 事务上下文管理器 ─────────────────────────────────────────────────
 @contextmanager
 def transaction():
-    """事务上下文管理器"""
-    conn = None
-    
+    conn = _get_conn()
     try:
-        conn = get_connection()
-        conn.autocommit = False
-        
         yield conn
-        
         conn.commit()
         logger.debug("事务提交成功")
-        
     except Exception as e:
-        logger.error(f"事务执行失败: {e}")
-        if conn:
-            conn.rollback()
-            logger.debug("事务已回滚")
+        conn.rollback()
+        logger.error(f"事务回滚: {e}")
         raise
-        
-    finally:
-        if conn:
-            return_connection(conn)
 
-# ========== 缓存和性能优化 ==========
-
-@st.cache_data(ttl=300)  # 缓存5分钟
+# ── 缓存查找数据 ─────────────────────────────────────────────────────
+@st.cache_data(ttl=LOOKUP_CACHE_TTL)
 def get_cached_lookup_data():
-    """获取缓存的查找数据"""
     try:
         return {
-            'mold_statuses': get_mold_statuses(),
-            'loan_statuses': get_loan_statuses(),
+            'mold_statuses':    get_mold_statuses(),
+            'loan_statuses':    get_loan_statuses(),
             'storage_locations': get_storage_locations(),
-            'functional_types': get_functional_types()
+            'functional_types': get_functional_types(),
         }
     except Exception as e:
         logger.error(f"获取缓存查找数据失败: {e}")
         return {}
 
 def clear_cache():
-    """清除缓存"""
     try:
-        if hasattr(st, 'cache_data'):
-            st.cache_data.clear()
+        st.cache_data.clear()
         logger.info("缓存已清除")
     except Exception as e:
         logger.error(f"清除缓存失败: {e}")
 
-# ========== 初始化 ==========
-
+# ── 初始化 ───────────────────────────────────────────────────────────
 def initialize_database():
-    """初始化数据库连接"""
     try:
-        init_connection_pool()
-        
-        # 测试连接
+        _get_conn()  # 确保连接和目录已创建
+
+        init_sql_path = os.path.join(
+            os.path.dirname(__file__), '..', '..', 'sql', 'sqlite_init.sql'
+        )
+        if os.path.exists(init_sql_path):
+            with open(init_sql_path, encoding='utf-8') as f:
+                sql_script = f.read()
+            conn = _get_conn()
+            conn.executescript(sql_script)
+            logger.info("数据库 schema 初始化完成")
+
+            # 兼容历史页面依赖的扩展列（尤其是生产排程模块）
+            compat_columns = {
+                'production_schedules': {
+                    'scheduled_start': "TEXT",
+                    'scheduled_end': "TEXT",
+                    'actual_start': "TEXT",
+                    'actual_end': "TEXT",
+                    'operator_id': "INTEGER REFERENCES users(user_id)",
+                    'quantity': "INTEGER DEFAULT 0",
+                }
+            }
+
+            for table_name, columns in compat_columns.items():
+                existing_columns = {col['name'] for col in get_table_info(table_name)}
+                for column_name, column_def in columns.items():
+                    if column_name not in existing_columns:
+                        conn.execute(
+                            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}"
+                        )
+                        logger.info(f"已为 {table_name} 补充兼容列: {column_name}")
+            conn.commit()
+        else:
+            logger.warning(f"初始化 SQL 文件不存在: {init_sql_path}")
+
         if test_connection():
-            logger.info("数据库连接正常")
+            logger.info(f"SQLite 数据库连接正常: {DB_PATH}")
             return True
         else:
-            logger.error("数据库连接失败")
+            logger.error("数据库连接测试失败")
             return False
-            
     except Exception as e:
         logger.error(f"数据库初始化失败: {e}")
         return False
 
-# 自动初始化
 initialize_database()

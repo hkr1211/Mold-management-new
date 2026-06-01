@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import logging
+import sqlite3
 from datetime import datetime, timedelta, date
 from utils.database import (
     execute_query, 
@@ -13,6 +14,64 @@ from utils.database import (
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def _format_loan_datetime(value, fmt='%Y-%m-%d %H:%M', default='N/A'):
+    """兼容 SQLite 字符串时间与 datetime 对象的显示格式化"""
+    if value is None or (isinstance(value, str) and not value.strip()) or pd.isna(value):
+        return default
+    if hasattr(value, 'strftime'):
+        return value.strftime(fmt)
+    try:
+        return pd.to_datetime(value).strftime(fmt)
+    except Exception:
+        return str(value)
+
+
+def _map_legacy_loan_field(field_name):
+    """将旧版借用字段映射到当前 SQLite schema"""
+    mapping = {
+        'application_timestamp': 'application_date',
+        'expected_return_timestamp': 'expected_return_date',
+        'actual_return_timestamp': 'actual_return_date',
+        'approval_timestamp': 'updated_at',
+        'loan_out_timestamp': 'updated_at',
+        'approver_id': None,
+    }
+    return mapping.get(field_name, field_name)
+
+
+def _build_loan_list_query(selected_status_id):
+    """构建兼容当前 SQLite schema 的借用申请列表查询"""
+    query = """
+    SELECT
+        mlr.loan_id,
+        m.mold_code,
+        m.mold_name,
+        u_applicant.full_name AS applicant_name,
+        mlr.application_date AS application_timestamp,
+        mlr.expected_return_date AS expected_return_timestamp,
+        NULL AS loan_out_timestamp,
+        mlr.actual_return_date AS actual_return_timestamp,
+        COALESCE(mlr.purpose, '') as destination_equipment,
+        ls.status_name AS loan_status,
+        mlr.loan_status_id,
+        '' AS approver_name,
+        COALESCE(mlr.remarks, '') as remarks,
+        m.mold_id
+    FROM mold_loan_records mlr
+    JOIN molds m ON mlr.mold_id = m.mold_id
+    JOIN users u_applicant ON mlr.applicant_id = u_applicant.user_id
+    JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
+    """
+
+    params = []
+    if selected_status_id != 0:
+        query += " WHERE mlr.loan_status_id = %s"
+        params.append(selected_status_id)
+
+    query += " ORDER BY mlr.application_date DESC"
+    return query, params
 
 # --- Helper Functions ---
 def get_status_id_by_name(status_name, table_name="loan_statuses", name_column="status_name", id_column="status_id"):
@@ -26,7 +85,7 @@ def get_status_id_by_name(status_name, table_name="loan_statuses", name_column="
             logging.error(f"Status '{status_name}' not found in table '{table_name}'.")
             st.error(f"系统错误：无法找到状态 '{status_name}'。请联系管理员。")
             return None
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Error fetching status ID for '{status_name}' from '{table_name}': {e}")
         st.error(f"数据库错误：获取状态ID失败。详情：{e}")
         return None
@@ -69,7 +128,7 @@ def search_available_molds(search_keyword=""):
     try:
         results = execute_query(base_query, params=tuple(params), fetch_all=True)
         return results if results else []
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Error searching available molds: {e}")
         st.error(f"搜索可用模具时出错: {e}")
         return []
@@ -95,7 +154,7 @@ def get_mold_details(mold_id):
     try:
         result = execute_query(query, params=(mold_id,), fetch_all=True)
         return result[0] if result else None
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取模具详情失败: {e}")
         return None
 
@@ -334,8 +393,8 @@ def submit_loan_application(mold_id, applicant_id, expected_return_date, destina
             # 插入借用申请
             insert_query = """
             INSERT INTO mold_loan_records (
-                mold_id, applicant_id, application_timestamp, 
-                expected_return_timestamp, destination_equipment, 
+                mold_id, applicant_id, application_date,
+                expected_return_date, purpose,
                 remarks, loan_status_id
             ) VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING loan_id
@@ -363,7 +422,7 @@ def submit_loan_application(mold_id, applicant_id, expected_return_date, destina
             # 提示后续流程
             st.info("📋 申请已提交，请等待模具库管理员审批。您可以在'查看与管理申请'页面查看申请状态。")
 
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Loan application submission failed: {e}", exc_info=True)
         st.error(f"提交申请失败：{e}")
 
@@ -402,7 +461,7 @@ def view_loan_applications():
             status_name = status['status_name'] if isinstance(status, dict) else status[1]
             status_filter_options[status_id] = status_name
         
-    except Exception as e:
+    except sqlite3.Error as e:
         st.error(f"获取状态列表失败：{e}")
         return
     
@@ -415,36 +474,7 @@ def view_loan_applications():
 
     # 获取借用申请数据 - 修复查询
     try:
-        # 基础查询，确保字段存在
-        query_base = """
-        SELECT
-            mlr.loan_id, 
-            m.mold_code, 
-            m.mold_name,
-            u_applicant.full_name AS applicant_name, 
-            mlr.application_timestamp,
-            mlr.expected_return_timestamp, 
-            mlr.loan_out_timestamp, 
-            mlr.actual_return_timestamp,
-            COALESCE(mlr.destination_equipment, '') as destination_equipment, 
-            ls.status_name AS loan_status, 
-            mlr.loan_status_id,
-            COALESCE(u_approver.full_name, '') AS approver_name, 
-            COALESCE(mlr.remarks, '') as remarks,
-            m.mold_id
-        FROM mold_loan_records mlr
-        JOIN molds m ON mlr.mold_id = m.mold_id
-        JOIN users u_applicant ON mlr.applicant_id = u_applicant.user_id
-        JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
-        LEFT JOIN users u_approver ON mlr.approver_id = u_approver.user_id
-        """
-        
-        params = []
-        if selected_status_id != 0:
-            query_base += " WHERE mlr.loan_status_id = %s"
-            params.append(selected_status_id)
-
-        query_base += " ORDER BY mlr.application_timestamp DESC"
+        query_base, params = _build_loan_list_query(selected_status_id)
         
         # 执行查询并显示调试信息
         st.write(f"🔍 执行查询，状态ID筛选: {selected_status_id if selected_status_id != 0 else '全部'}")
@@ -460,10 +490,8 @@ def view_loan_applications():
             # 如果筛选条件下没有记录，显示所有记录用于调试
             if selected_status_id != 0:
                 st.write("🔧 显示所有记录用于调试:")
-                all_records = execute_query(
-                    query_base.replace(" WHERE mlr.loan_status_id = %s", ""), 
-                    fetch_all=True
-                )
+                all_query, all_params = _build_loan_list_query(0)
+                all_records = execute_query(all_query, params=tuple(all_params), fetch_all=True)
                 if all_records:
                     for record in all_records:
                         st.write(f"- 申请ID: {record.get('loan_id')}, 状态: {record.get('loan_status')} (ID: {record.get('loan_status_id')})")
@@ -510,14 +538,14 @@ def view_loan_applications():
 
                 with details_col:
                     st.write(f"**申请ID：** {app_id}")
-                    st.write(f"**申请时间：** {record['application_timestamp'].strftime('%Y-%m-%d %H:%M') if pd.notna(record['application_timestamp']) else 'N/A'}")
+                    st.write(f"**申请时间：** {_format_loan_datetime(record.get('application_timestamp'), '%Y-%m-%d %H:%M')}")
                     if pd.notna(record.get('expected_return_timestamp')):
-                        st.write(f"**预计归还：** {record['expected_return_timestamp'].strftime('%Y-%m-%d')}")
+                        st.write(f"**预计归还：** {_format_loan_datetime(record.get('expected_return_timestamp'), '%Y-%m-%d')}")
                     st.write(f"**使用设备：** {record['destination_equipment']}")
                     if pd.notna(record.get('loan_out_timestamp')):
-                        st.write(f"**借出时间：** {record['loan_out_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                        st.write(f"**借出时间：** {_format_loan_datetime(record.get('loan_out_timestamp'), '%Y-%m-%d %H:%M')}")
                     if pd.notna(record.get('actual_return_timestamp')):
-                        st.write(f"**归还时间：** {record['actual_return_timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                        st.write(f"**归还时间：** {_format_loan_datetime(record.get('actual_return_timestamp'), '%Y-%m-%d %H:%M')}")
                     if record['approver_name']:
                         st.write(f"**审批人：** {record['approver_name']}")
                     if record['remarks']:
@@ -553,7 +581,7 @@ def view_loan_applications():
                             if mark_as_returned(app_id, mold_id, current_user_id):
                                 st.rerun()
 
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Failed to load loan applications: {e}")
         st.error(f"加载借用申请列表失败：{e}")
         st.exception(e)  # 显示详细错误用于调试
@@ -591,18 +619,24 @@ def _update_loan_and_mold_status(loan_id, mold_id,
                 return False
 
             # Update loan application
-            update_loan_q = "UPDATE mold_loan_records SET loan_status_id = %s"
+            update_loan_q = "UPDATE mold_loan_records SET loan_status_id = %s, updated_at = %s"
             params_loan = [target_loan_status_id]
             
             now_timestamp = datetime.now()
+            params_loan.append(now_timestamp)
             if loan_timestamp_field:
-                update_loan_q += f", {loan_timestamp_field} = %s"
-                params_loan.append(now_timestamp)
+                mapped_timestamp_field = _map_legacy_loan_field(loan_timestamp_field)
+                if mapped_timestamp_field and mapped_timestamp_field != 'updated_at':
+                    update_loan_q += f", {mapped_timestamp_field} = %s"
+                    params_loan.append(now_timestamp)
             if loan_operator_field:
-                update_loan_q += f", {loan_operator_field} = %s"
-                params_loan.append(operator_user_id)
+                mapped_operator_field = _map_legacy_loan_field(loan_operator_field)
+                if mapped_operator_field:
+                    update_loan_q += f", {mapped_operator_field} = %s"
+                    params_loan.append(operator_user_id)
             if remarks_field and remarks_value is not None:
-                update_loan_q += f", {remarks_field} = %s"
+                mapped_remarks_field = _map_legacy_loan_field(remarks_field)
+                update_loan_q += f", {mapped_remarks_field} = %s"
                 params_loan.append(remarks_value)
             
             update_loan_q += " WHERE loan_id = %s AND loan_status_id = %s"
@@ -625,7 +659,7 @@ def _update_loan_and_mold_status(loan_id, mold_id,
             st.success(f"操作成功：申请状态已更新为 {target_loan_status_name}。")
             return True
 
-    except Exception as e:
+    except sqlite3.Error as e:
         logging.error(f"Error during status update for loan {loan_id}: {e}", exc_info=True)
         st.error(f"操作失败：{e}")
         return False
@@ -675,13 +709,21 @@ def mark_as_returned(loan_id, mold_id, operator_user_id):
 # --- Main page function ---
 def show():
     """Main function to show loan management page"""
-    st.title("🛠️ 模具借用管理")
-    
+    from utils.ui import inject_global_css, page_header
+    from utils.nav import setup_sidebar
+    inject_global_css()
+
     # Check user permissions
     user_role = st.session_state.get('user_role', '')
+    if not st.session_state.get('logged_in'):
+        st.error("🔒 请先登录以访问此页面。")
+        st.stop()
     if user_role not in ['超级管理员', '模具库管理员', '冲压操作工']:
-        st.warning("您没有权限访问此功能")
+        st.error("❌ 权限不足：您无法访问借用管理功能。")
         return
+
+    setup_sidebar("2_借用管理.py")
+    page_header("📋", "模具借用管理", "借用申请 · 审批 · 归还流程")
     
     # 添加使用说明
     with st.expander("💡 使用说明", expanded=False):
@@ -728,3 +770,6 @@ def show():
         
         with tab2:
             create_loan_application()
+
+
+show()
