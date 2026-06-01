@@ -17,7 +17,7 @@ import logging
 import sqlite3
 from utils.auth import (
     has_permission, get_all_users, create_user, update_user_status,
-    get_user_activity_log, get_all_roles, validate_password_strength,
+    update_user, get_user_activity_log, get_all_roles, validate_password_strength,
     update_user_password, log_user_action
 )
 from utils.database import execute_query, test_connection
@@ -123,7 +123,12 @@ def show_user_list():
         if st.button("重试获取数据"):
             st.rerun()
         return
-    
+
+    # 编辑用户表单（点击某用户卡片"✏️ 编辑"后显示）
+    if st.session_state.get('edit_user_id'):
+        _render_edit_user_form(users)
+        st.markdown("---")
+
     # 应用筛选
     original_count = len(users)
     
@@ -170,6 +175,74 @@ def show_user_list():
                 st.rerun()
         else:
             st.warning("系统中暂无用户数据")
+
+def _render_edit_user_form(users):
+    """编辑用户基本信息（姓名/邮箱/角色），可选重置密码。用户名不可改。"""
+    uid = st.session_state.get('edit_user_id')
+    target = next((u for u in users if u['user_id'] == uid), None)
+    if not target:
+        # 目标用户已不在当前列表（可能已被删除/刷新），清理状态
+        st.session_state.pop('edit_user_id', None)
+        return
+
+    role_names = [r['role_name'] for r in get_all_roles()]
+
+    with st.expander(f"✏️ 编辑用户：{target.get('full_name', '')}（{target.get('username', '')}）", expanded=True):
+        with st.form(f"edit_user_form_{uid}"):
+            st.caption("用户名不可修改；启用/禁用请用卡片上的对应按钮。")
+            full_name = st.text_input("姓名 *", value=target.get('full_name') or '')
+            email = st.text_input("邮箱", value=target.get('email') or '')
+
+            if role_names:
+                cur_role = target.get('role_name')
+                idx = role_names.index(cur_role) if cur_role in role_names else 0
+                role = st.selectbox("角色", role_names, index=idx)
+            else:
+                role = None
+                st.warning("⚠️ 未获取到角色列表，本次不修改角色")
+
+            st.markdown("**重置密码**（留空则不修改）")
+            new_pw = st.text_input("新密码", type="password", key=f"edit_pw_{uid}")
+            new_pw2 = st.text_input("确认新密码", type="password", key=f"edit_pw2_{uid}")
+
+            c1, c2 = st.columns(2)
+            save = c1.form_submit_button("💾 保存", type="primary", use_container_width=True)
+            cancel = c2.form_submit_button("取消", use_container_width=True)
+
+        if cancel:
+            st.session_state.pop('edit_user_id', None)
+            st.rerun()
+
+        if save:
+            if not full_name.strip():
+                st.error("❌ 姓名不能为空")
+                return
+            if email.strip() and '@' not in email:
+                st.error("❌ 邮箱格式不正确")
+                return
+
+            ok, msg = update_user(uid, full_name, email, role)
+            if not ok:
+                st.error(f"❌ {msg}")
+                return
+
+            # 可选：重置密码
+            if new_pw or new_pw2:
+                if new_pw != new_pw2:
+                    st.error("❌ 两次输入的新密码不一致（用户信息已保存，密码未修改）")
+                    return
+                pok, pmsg = update_user_password(uid, new_pw)
+                if not pok:
+                    st.error(f"❌ 用户信息已保存，但密码修改失败：{pmsg}")
+                    return
+
+            log_user_action('UPDATE_USER', 'users', str(uid))
+            st.success(f"✅ {msg}")
+            st.session_state.pop('edit_user_id', None)
+            if hasattr(st, 'cache_data'):
+                st.cache_data.clear()
+            st.rerun()
+
 
 def display_user_card(user):
     """显示用户卡片"""
@@ -231,7 +304,7 @@ def display_user_card(user):
     with col2:
         if st.button(f"✏️ 编辑", key=f"edit_{user['user_id']}"):
             st.session_state['edit_user_id'] = user['user_id']
-            st.info("编辑功能开发中...")
+            st.rerun()
     
     with col3:
         if st.button(f"📊 日志", key=f"logs_{user['user_id']}"):

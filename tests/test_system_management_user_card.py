@@ -84,6 +84,7 @@ def _load_system_management_module(logs=None, users=None):
     auth.get_all_users = lambda *a, **kw: users or []
     auth.create_user = lambda *a, **kw: (True, "ok")
     auth.update_user_status = lambda *a, **kw: (True, "ok")
+    auth.update_user = lambda *a, **kw: (True, "ok")
     auth.get_all_roles = lambda *a, **kw: []
     auth.get_user_activity_log = lambda *a, **kw: logs or []
     auth.validate_password_strength = lambda *a, **kw: (True, "ok")
