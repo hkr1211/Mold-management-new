@@ -203,3 +203,10 @@ class TestErrorHandlingContract:
         import sqlite3
         with pytest.raises(sqlite3.Error):
             _db_module.execute_query("SELECT * FROM no_such_table_xyz", fetch_all=True)
+
+    def test_validators_surface_bad_identifier(self):
+        # 校验函数收到非白名单表名属编码缺陷：应抛 ValueError，而非被吞成 False
+        with pytest.raises(ValueError):
+            _db_module.validate_foreign_key('not_whitelisted_table', 'col', 1)
+        with pytest.raises(ValueError):
+            _db_module.validate_unique_constraint('not_whitelisted_table', 'col', 1)

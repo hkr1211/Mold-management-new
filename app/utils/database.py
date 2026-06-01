@@ -366,7 +366,7 @@ def validate_foreign_key(table: str, column: str, value: Any) -> bool:
             params=(value,), fetch_one=True
         )
         return result is not None
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"验证外键失败: {table}.{column}={value}, 错误: {e}")
         return False
 
@@ -391,7 +391,7 @@ def validate_unique_constraint(table: str, column: str, value: Any,
         query += " LIMIT 1"
         result = execute_query(query, params=tuple(params), fetch_one=True)
         return result is None  # 不存在才满足唯一约束
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"验证唯一约束失败: {table}.{column}={value}, 错误: {e}")
         return False
 
@@ -411,10 +411,13 @@ def bulk_insert(table: str, columns: List[str], data: List[List]) -> bool:
         conn.commit()
         logger.info(f"批量插入成功: {table} — {len(data)} 条")
         return True
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"批量插入失败: {e}")
         conn.rollback()
         return False
+    except Exception:
+        conn.rollback()  # 编码缺陷也先回滚事务，再上抛暴露
+        raise
 
 def bulk_update(table: str, updates: List[Dict]) -> bool:
     if not updates:
@@ -437,10 +440,13 @@ def bulk_update(table: str, updates: List[Dict]) -> bool:
         conn.commit()
         logger.info(f"批量更新成功: {table} — {len(updates)} 条")
         return True
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.error(f"批量更新失败: {e}")
         conn.rollback()
         return False
+    except Exception:
+        conn.rollback()  # 编码缺陷也先回滚事务，再上抛暴露
+        raise
 
 # ── 事务上下文管理器 ─────────────────────────────────────────────────
 @contextmanager
