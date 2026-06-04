@@ -42,9 +42,24 @@ page_header("🛠️", "模具管理", "模具台账 · 新增 · 编辑")
 
 # --- 数据加载 ---
 @st.cache_data(ttl=300)
-def load_molds(search_code="", search_name="", status_filter="全部"):
+def load_molds(search_code="", search_name="", status_filter="全部", page=1, page_size=100):
     # 不再吞异常：DB 故障与编码缺陷一律上抛，由调用方（_load_or_stop）区分
     # 展示“加载失败”与“暂无数据”。
+    where_clauses = []
+    params = []
+
+    if search_code:
+        where_clauses.append("m.mold_code LIKE %s")
+        params.append(f"%{search_code}%")
+    if search_name:
+        where_clauses.append("m.mold_name LIKE %s")
+        params.append(f"%{search_name}%")
+    if status_filter != "全部":
+        where_clauses.append("ms.status_name = %s")
+        params.append(status_filter)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    offset = max(page - 1, 0) * page_size
     query = """
     SELECT
         m.mold_id,
@@ -65,20 +80,13 @@ def load_molds(search_code="", search_name="", status_filter="全部"):
     LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
     LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
     LEFT JOIN users u ON m.responsible_person_id = u.user_id
+    {where_sql}
     ORDER BY m.created_at DESC
+    LIMIT %s OFFSET %s
     """
-    rows = execute_query(query, fetch_all=True) or []
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    if search_code:
-        df = df[df['模具编号'].str.contains(search_code, case=False, na=False)]
-    if search_name:
-        df = df[df['模具名称'].str.contains(search_name, case=False, na=False)]
-    if status_filter != "全部":
-        df = df[df['当前状态'] == status_filter]
-    return df
+    params.extend([page_size, offset])
+    rows = execute_query(query.format(where_sql=where_sql), params=tuple(params), fetch_all=True) or []
+    return pd.DataFrame(rows)
 
 @st.cache_data(ttl=600)
 def load_lookup_data():
@@ -107,13 +115,17 @@ with tab1:
         status_names = ["全部"] + [s['status_name'] for s in statuses]
         status_filter = st.selectbox("状态筛选", status_names, key="status_filter")
 
+    page_col, size_col, _ = st.columns([1, 1, 4])
+    page = page_col.number_input("页码", min_value=1, value=1, step=1, key="mold_page")
+    page_size = size_col.selectbox("每页", [50, 100, 200], index=1, key="mold_page_size")
+
     col_refresh, col_export = st.columns([1, 7])
     with col_refresh:
         if st.button("🔄 刷新", key="refresh_list"):
             st.cache_data.clear()
             st.rerun()
 
-    df = _load_or_stop(load_molds, search_code, search_name, status_filter)
+    df = _load_or_stop(load_molds, search_code, search_name, status_filter, page, page_size)
 
     if df.empty:
         st.info("暂无符合条件的模具记录。")
@@ -125,7 +137,7 @@ with tab1:
             use_container_width=True,
             hide_index=True,
         )
-        st.caption(f"共 {len(df)} 条记录")
+        st.caption(f"当前第 {page} 页，显示 {len(df)} 条记录")
 
         # 选中某行显示详情
         if not df.empty:

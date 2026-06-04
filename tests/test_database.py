@@ -181,6 +181,21 @@ class TestGetDbConnectionCompatibility:
         )
         assert rows == [{"id": 1, "name": "alice"}]
 
+    def test_autocommit_false_context_rolls_back_on_early_exit(self):
+        with _db_module.get_db_connection() as conn:
+            conn.autocommit = False
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE rollback_demo (name TEXT)")
+            conn.commit()
+
+        with _db_module.get_db_connection() as conn:
+            conn.autocommit = False
+            cur = conn.cursor()
+            cur.execute("INSERT INTO rollback_demo (name) VALUES (%s)", ("early",))
+
+        rows = _db_module.execute_query("SELECT name FROM rollback_demo", fetch_all=True)
+        assert rows == []
+
 
 # ══════════════════════════════════════════════════════════════════
 # 错误处理约定：数据库故障降级，编码缺陷上抛（不伪装成空数据）

@@ -29,9 +29,24 @@ CAN_MANAGE = has_permission('manage_molds') or has_permission('manage_maintenanc
 
 # --- 数据加载 ---
 @st.cache_data(ttl=300)
-def load_parts(mold_filter="", category_filter="全部", status_filter="全部"):
+def load_parts(mold_filter="", category_filter="全部", status_filter="全部", page=1, page_size=100):
     # 数据加载不再吞异常：DB 故障与编码缺陷均向上抛，由调用方
     # （show_parts_list）区分展示“加载失败”与“暂无数据”。
+    where_clauses = []
+    params = []
+
+    if mold_filter:
+        where_clauses.append("m.mold_code LIKE %s")
+        params.append(f"%{mold_filter}%")
+    if category_filter != "全部":
+        where_clauses.append("c.category_name = %s")
+        params.append(category_filter)
+    if status_filter != "全部":
+        where_clauses.append("ms.status_name = %s")
+        params.append(status_filter)
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+    offset = max(page - 1, 0) * page_size
     query = """
     SELECT
         p.part_id,
@@ -49,20 +64,13 @@ def load_parts(mold_filter="", category_filter="全部", status_filter="全部")
     JOIN molds m ON p.mold_id = m.mold_id
     JOIN mold_part_categories c ON p.part_category_id = c.category_id
     LEFT JOIN mold_statuses ms ON p.current_status_id = ms.status_id
+    {where_sql}
     ORDER BY p.created_at DESC
+    LIMIT %s OFFSET %s
     """
-    rows = execute_query(query, fetch_all=True) or []
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    if mold_filter:
-        df = df[df['所属模具'].str.contains(mold_filter, case=False, na=False)]
-    if category_filter != "全部":
-        df = df[df['部件类别'] == category_filter]
-    if status_filter != "全部":
-        df = df[df['状态'] == status_filter]
-    return df
+    params.extend([page_size, offset])
+    rows = execute_query(query.format(where_sql=where_sql), params=tuple(params), fetch_all=True) or []
+    return pd.DataFrame(rows)
 
 @st.cache_data(ttl=600)
 def load_part_lookups():
@@ -109,13 +117,17 @@ def show_parts_list():
     cat_filter = c2.selectbox("部件类别", cat_names, key="part_cat_filter")
     sta_filter = c3.selectbox("状态", st_names, key="part_sta_filter")
 
+    page_col, size_col, _ = st.columns([1, 1, 4])
+    page = page_col.number_input("页码", min_value=1, value=1, step=1, key="part_page")
+    page_size = size_col.selectbox("每页", [50, 100, 200], index=1, key="part_page_size")
+
     col_r, _ = st.columns([1, 7])
     if col_r.button("🔄 刷新", key="refresh_parts"):
         st.cache_data.clear()
         st.rerun()
 
     try:
-        df = load_parts(mold_filter, cat_filter, sta_filter)
+        df = load_parts(mold_filter, cat_filter, sta_filter, page, page_size)
     except sqlite3.Error as e:
         logger.error(f"加载部件列表失败: {e}")
         st.error(f"❌ 数据加载失败：{e}")
@@ -127,7 +139,7 @@ def show_parts_list():
 
     display_cols = ['部件编号', '部件名称', '所属模具', '部件类别', '材质', '安装日期', '设计寿命', '状态']
     st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-    st.caption(f"共 {len(df)} 条记录")
+    st.caption(f"当前第 {page} 页，显示 {len(df)} 条记录")
 
     if CAN_MANAGE:
         with st.expander("🗑️ 删除部件", expanded=False):

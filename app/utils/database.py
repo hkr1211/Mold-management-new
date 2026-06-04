@@ -27,18 +27,21 @@ logger = logging.getLogger(__name__)
 
 # ── 连接管理（每线程独立连接 + WAL 模式）────────────────────────────
 _local = threading.local()
+_init_lock = threading.Lock()
+_initialized = False
 
 def _get_conn() -> sqlite3.Connection:
     conn = getattr(_local, 'conn', None)
     if conn is None:
         db_dir = os.path.dirname(os.path.abspath(DB_PATH))
         os.makedirs(db_dir, exist_ok=True)
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False,
+        conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False,
                                detect_types=sqlite3.PARSE_DECLTYPES)
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA foreign_keys=ON')
         conn.execute('PRAGMA synchronous=NORMAL')
+        conn.execute('PRAGMA busy_timeout=30000')
         _local.conn = conn
     return conn
 
@@ -154,6 +157,8 @@ class _CompatConnection:
             self.rollback()
         elif self.autocommit:
             self.commit()
+        else:
+            self.rollback()
         return False
 
     def __getattr__(self, name):
@@ -531,4 +536,15 @@ def initialize_database():
         logger.error(f"数据库初始化失败: {e}")
         return False
 
-initialize_database()
+def ensure_database_initialized(force: bool = False) -> bool:
+    """进程级初始化守卫：Streamlit rerun 时不重复执行 schema 脚本。"""
+    global _initialized
+    if _initialized and not force:
+        return True
+
+    with _init_lock:
+        if _initialized and not force:
+            return True
+        ok = initialize_database()
+        _initialized = bool(ok)
+        return ok

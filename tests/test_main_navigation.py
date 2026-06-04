@@ -78,6 +78,8 @@ def _load_main_module(clicked_label: str = ""):
 
     database = types.ModuleType("utils.database")
     database.execute_query = lambda *a, **kw: None
+    database.initialize_database = lambda: True
+    database.ensure_database_initialized = lambda: True
     database.test_connection = lambda: True
     sys.modules["utils.database"] = database
 

@@ -6,7 +6,6 @@ services:
     working_dir: /app
     restart: always
     volumes:
-      - .:/app
       - sqlite_data:/app/data
     ports:
       - "8501:8501"

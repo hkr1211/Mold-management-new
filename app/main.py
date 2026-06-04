@@ -1,7 +1,7 @@
 # app/main.py
 import streamlit as st
 from utils.auth import login_user, logout_user
-from utils.database import execute_query, test_connection
+from utils.database import execute_query, ensure_database_initialized, test_connection
 from utils.ui import inject_global_css, page_header, stat_card, activity_row, PURPLE, SUCCESS, WARNING, DANGER
 from utils.nav import NAV, nav_buttons, setup_sidebar
 import logging
@@ -352,6 +352,10 @@ def _show_recent_activities():
 # ══════════════════════════════════════════════════════════════════════
 def main():
     inject_global_css()
+    if not ensure_database_initialized():
+        st.error("❌ 数据库初始化失败，请检查 SQLite 路径和初始化脚本。")
+        st.stop()
+
     _init_session()
 
     if not st.session_state.get('logged_in'):

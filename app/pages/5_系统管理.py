@@ -467,9 +467,6 @@ def show_create_user():
                     # 设置高亮显示标记
                     st.session_state['show_new_user'] = cleaned['username']
                     
-                    # 延迟后刷新页面
-                    import time
-                    time.sleep(2)
                     st.rerun()
                 else:
                     st.error(f"❌ {msg}")
@@ -950,7 +947,7 @@ def show_realtime_monitor():
     
     with col1:
         # CPU使用率
-        cpu_percent = psutil.cpu_percent(interval=1)
+        cpu_percent = psutil.cpu_percent(interval=0)
         st.metric(
             "CPU使用率",
             f"{cpu_percent}%",
@@ -1547,10 +1544,6 @@ def verify_create_user_function():
                 
                 if success:
                     st.success(f"✅ 用户创建成功: {msg}")
-                    
-                    # 等待一下再查询
-                    import time
-                    time.sleep(1)
                     
                     # 记录创建后的用户数量
                     users_after = get_all_users()

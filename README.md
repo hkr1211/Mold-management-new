@@ -4,10 +4,16 @@
 
 ## Quick Start
 
-在项目根目录执行：
+开发环境在项目根目录执行（会把当前源码挂载到容器，便于本地迭代）：
 
 ```bash
 docker compose up -d --build
+```
+
+生产环境使用独立 Compose 文件（不挂载源码，只持久化 SQLite 数据卷）：
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --build
 ```
 
 然后在浏览器打开：
