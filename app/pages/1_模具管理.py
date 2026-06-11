@@ -8,7 +8,7 @@ from utils.database import (
     execute_query, get_all_molds, get_mold_statuses,
     get_storage_locations, get_functional_types
 )
-from utils.auth import has_permission, log_user_action
+from utils.auth import has_permission, log_user_action, restore_session
 from utils.ui import inject_global_css, page_header
 from utils.nav import setup_sidebar
 
@@ -29,6 +29,7 @@ def _load_or_stop(fn, *args, **kwargs):
 inject_global_css()
 
 # --- 访问控制 ---
+restore_session()  # 刷新页面后从令牌恢复登录态
 if not st.session_state.get('logged_in', False):
     st.error("🔒 请先登录以访问此页面。")
     st.stop()

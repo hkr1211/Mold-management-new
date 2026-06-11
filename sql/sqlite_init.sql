@@ -173,6 +173,15 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     locked_until TEXT
 );
 
+-- ── 登录会话（服务端令牌，支持刷新页面后恢复登录态）──────────────────
+CREATE TABLE IF NOT EXISTS user_sessions (
+    session_token TEXT    PRIMARY KEY,
+    user_id       INTEGER NOT NULL REFERENCES users(user_id),
+    created_at    TEXT    DEFAULT (datetime('now')),
+    expires_at    TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_user_sessions_user ON user_sessions(user_id);
+
 -- ── 模次累计流水（molds.accumulated_strokes 的唯一审计来源）──────────
 -- source_type: loan_return（借用归还）/ schedule_complete（排程完工）/ manual_adjust（台账手动调整）
 CREATE TABLE IF NOT EXISTS mold_stroke_logs (

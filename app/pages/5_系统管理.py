@@ -18,7 +18,7 @@ import sqlite3
 from utils.auth import (
     has_permission, get_all_users, create_user, update_user_status,
     update_user, get_user_activity_log, get_all_roles, validate_password_strength,
-    update_user_password, log_user_action
+    update_user_password, log_user_action, restore_session
 )
 from utils.database import execute_query, test_connection
 from utils.ui import inject_global_css, page_header
@@ -28,6 +28,7 @@ def show():
     """系统管理主页面"""
     inject_global_css()
 
+    restore_session()  # 刷新页面后从令牌恢复登录态
     if not st.session_state.get('logged_in'):
         st.error("🔒 请先登录以访问此页面。")
         st.stop()

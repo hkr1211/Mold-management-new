@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from datetime import date
 from utils.database import execute_query
-from utils.auth import has_permission, log_user_action
+from utils.auth import has_permission, log_user_action, restore_session
 from utils.ui import inject_global_css, page_header
 from utils.nav import setup_sidebar
 
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 inject_global_css()
 
 # --- 权限和登录检查 ---
+restore_session()  # 刷新页面后从令牌恢复登录态
 if not st.session_state.get('logged_in', False):
     st.error("🔒 请先登录以访问此页面。")
     st.stop()

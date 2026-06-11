@@ -764,6 +764,8 @@ def show():
     inject_global_css()
 
     # Check user permissions
+    from utils.auth import restore_session
+    restore_session()  # 刷新页面后从令牌恢复登录态
     user_role = st.session_state.get('user_role', '')
     if not st.session_state.get('logged_in'):
         st.error("🔒 请先登录以访问此页面。")

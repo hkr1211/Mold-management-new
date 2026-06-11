@@ -80,6 +80,7 @@ def _load_system_management_module(logs=None, users=None):
     sys.modules["pandas"] = pd
 
     auth = types.ModuleType("utils.auth")
+    auth.restore_session = lambda *a, **kw: False
     auth.has_permission = lambda *a, **kw: True
     auth.get_all_users = lambda *a, **kw: users or []
     auth.create_user = lambda *a, **kw: (True, "ok")

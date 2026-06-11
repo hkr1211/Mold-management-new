@@ -57,6 +57,7 @@ def _load_module():
     sys.modules["psutil"] = psutil
 
     auth = types.ModuleType("utils.auth")
+    auth.restore_session = lambda *a, **kw: False
     for fn in ("has_permission", "get_all_users", "create_user", "update_user_status",
                "update_user", "get_user_activity_log", "get_all_roles",
                "validate_password_strength", "update_user_password", "log_user_action"):

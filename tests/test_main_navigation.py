@@ -72,6 +72,7 @@ def _load_main_module(clicked_label: str = ""):
     sys.modules["utils.ui"] = ui
 
     auth = types.ModuleType("utils.auth")
+    auth.restore_session = lambda *a, **kw: False
     auth.login_user = lambda *a, **kw: None
     auth.logout_user = lambda *a, **kw: None
     sys.modules["utils.auth"] = auth
