@@ -1,6 +1,7 @@
 # pages/1_模具管理.py
 import streamlit as st
 import pandas as pd
+import plotly.express as px
 import logging
 import sqlite3
 from datetime import date
@@ -100,9 +101,120 @@ def load_lookup_data():
     ) or []
     return statuses, locations, types, users_raw
 
+# --- 模具履历（一页式）查询与计算 ---
+
+def _build_mold_loan_history_query():
+    return """
+    SELECT
+        mlr.application_date AS 申请时间,
+        u.full_name          AS 申请人,
+        ls.status_name       AS 状态,
+        mlr.expected_return_date AS 预计归还,
+        mlr.actual_return_date   AS 实际归还,
+        COALESCE(mlr.purpose, '') AS 用途
+    FROM mold_loan_records mlr
+    LEFT JOIN users u ON mlr.applicant_id = u.user_id
+    LEFT JOIN loan_statuses ls ON mlr.loan_status_id = ls.status_id
+    WHERE mlr.mold_id = %s
+    ORDER BY mlr.application_date DESC
+    LIMIT 20
+    """
+
+
+def _build_mold_maintenance_history_query():
+    return """
+    SELECT
+        ml.maintenance_start_timestamp AS 开始时间,
+        ml.maintenance_end_timestamp   AS 结束时间,
+        COALESCE(mt.type_name, '未分类') AS 类型,
+        u.full_name                    AS 技师,
+        mrs.status_name                AS 结果,
+        ml.cost                        AS 费用,
+        ml.strokes_at_maintenance      AS 当时模次
+    FROM mold_maintenance_logs ml
+    LEFT JOIN maintenance_types mt ON ml.maintenance_type_id = mt.type_id
+    LEFT JOIN users u ON ml.technician_id = u.user_id
+    LEFT JOIN maintenance_result_statuses mrs ON ml.result_status_id = mrs.status_id
+    WHERE ml.mold_id = %s
+    ORDER BY COALESCE(ml.maintenance_start_timestamp, ml.created_at) DESC
+    LIMIT 20
+    """
+
+
+def _build_mold_parts_query():
+    return """
+    SELECT
+        p.part_code      AS 部件编号,
+        p.part_name      AS 部件名称,
+        c.category_name  AS 类别,
+        p.material       AS 材质,
+        p.installation_date AS 安装日期,
+        p.lifespan_strokes  AS 设计寿命,
+        ms.status_name   AS 状态
+    FROM mold_parts p
+    LEFT JOIN mold_part_categories c ON p.part_category_id = c.category_id
+    LEFT JOIN mold_statuses ms ON p.current_status_id = ms.status_id
+    WHERE p.mold_id = %s
+    ORDER BY p.part_code
+    """
+
+
+def _build_stroke_logs_query():
+    return """
+    SELECT
+        sl.created_at    AS 时间,
+        sl.strokes_added AS 模次,
+        sl.source_type   AS 来源,
+        sl.source_id     AS 单号,
+        u.full_name      AS 操作人,
+        sl.remarks       AS 备注
+    FROM mold_stroke_logs sl
+    LEFT JOIN users u ON sl.operator_id = u.user_id
+    WHERE sl.mold_id = %s
+    ORDER BY sl.created_at ASC, sl.stroke_log_id ASC
+    LIMIT 200
+    """
+
+
+_STROKE_SOURCE_LABELS = {
+    'loan_return': '借用归还',
+    'schedule_complete': '排程完工',
+    'manual_adjust': '手动调整',
+}
+
+
+def _stroke_curve_points(current_accumulated, logs):
+    """由流水反推累计模次曲线。
+
+    起点 = 当前累计 − 全部流水之和（即建账初始值），随后按时间逐笔累加。
+    返回 (起点值, [(时间, 累计值), ...])，logs 须按时间升序。
+    """
+    current = int(current_accumulated or 0)
+    total_delta = sum(int(l['模次'] or 0) for l in logs)
+    base = current - total_delta
+    points = []
+    running = base
+    for l in logs:
+        running += int(l['模次'] or 0)
+        points.append((l['时间'], running))
+    return base, points
+
+
+def _last_maintenance_strokes(mold_id):
+    """最近一次已完成保养时的模次（与维修页预警口径一致）。"""
+    row = execute_query(
+        """
+        SELECT MAX(COALESCE(strokes_at_maintenance, 0)) AS s
+        FROM mold_maintenance_logs
+        WHERE mold_id = %s AND maintenance_end_timestamp IS NOT NULL
+        """,
+        params=(mold_id,), fetch_one=True)
+    return (row['s'] if row and row['s'] is not None else 0)
+
+
 # --- 主页面 ---
 
-tab1, tab2, tab3 = st.tabs(["📋 模具列表", "➕ 新增模具", "✏️ 编辑模具"])
+tab1, tab2, tab3, tab4 = st.tabs(["📋 模具列表", "➕ 新增模具", "✏️ 编辑模具", "📜 模具履历"])
 
 # ========== TAB1：模具列表 ==========
 with tab1:
@@ -362,3 +474,137 @@ with tab3:
                         except sqlite3.Error as e:
                             logger.error(f"更新模具失败: {e}")
                             st.error(f"❌ 更新失败：{e}")
+
+# ========== TAB4：模具履历（一页式） ==========
+with tab4:
+    hist_kw = st.text_input("🔍 搜索模具（编号/名称）", key="hist_search",
+                            placeholder="留空显示最近创建的模具")
+    if hist_kw.strip():
+        cand = _load_or_stop(
+            execute_query,
+            "SELECT mold_id, mold_code, mold_name FROM molds "
+            "WHERE mold_code LIKE %s OR mold_name LIKE %s ORDER BY mold_code LIMIT 50",
+            params=(f"%{hist_kw.strip()}%", f"%{hist_kw.strip()}%"), fetch_all=True) or []
+    else:
+        cand = _load_or_stop(
+            execute_query,
+            "SELECT mold_id, mold_code, mold_name FROM molds "
+            "ORDER BY created_at DESC LIMIT 50", fetch_all=True) or []
+
+    if not cand:
+        st.info("未找到模具。")
+    else:
+        cand_map = {f"{c['mold_code']} — {c['mold_name']}": c['mold_id'] for c in cand}
+        sel_label = st.selectbox("选择模具", list(cand_map.keys()), key="hist_select")
+        hist_mold_id = cand_map[sel_label]
+
+        mold = _load_or_stop(
+            execute_query,
+            """
+            SELECT m.*, mft.type_name AS functional_type,
+                   ms.status_name AS current_status,
+                   sl.location_name AS current_location,
+                   u.full_name AS responsible_person
+            FROM molds m
+            LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
+            LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+            LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+            LEFT JOIN users u ON m.responsible_person_id = u.user_id
+            WHERE m.mold_id = %s
+            """,
+            params=(hist_mold_id,), fetch_one=True)
+
+        if not mold:
+            st.error("模具不存在或已删除。")
+        else:
+            # ── 基本信息 ──
+            st.markdown(f"### 🛠️ {mold['mold_code']} — {mold['mold_name']}")
+            i1, i2, i3, i4 = st.columns(4)
+            i1.markdown(f"**功能类型**：{mold.get('functional_type') or '—'}")
+            i2.markdown(f"**当前状态**：{mold.get('current_status') or '—'}")
+            i3.markdown(f"**存放位置**：{mold.get('current_location') or '—'}")
+            i4.markdown(f"**负责人**：{mold.get('responsible_person') or '—'}")
+            i1.markdown(f"**供应商**：{mold.get('supplier') or '—'}")
+            i2.markdown(f"**图号**：{mold.get('mold_drawing_number') or '—'}")
+            i3.markdown(f"**制造日期**：{mold.get('manufacturing_date') or '—'}")
+            i4.markdown(f"**备注**：{mold.get('remarks') or '—'}")
+
+            # ── 寿命与保养 ──
+            st.markdown("#### 📊 寿命与保养")
+            accumulated = int(mold.get('accumulated_strokes') or 0)
+            lifespan = int(mold.get('theoretical_lifespan_strokes') or 0)
+            cycle = int(mold.get('maintenance_cycle_strokes') or 0)
+            since_maint = accumulated - _load_or_stop(_last_maintenance_strokes, hist_mold_id)
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("累计模次", f"{accumulated:,}")
+            m2.metric("理论寿命", f"{lifespan:,}" if lifespan else "未设置")
+            m3.metric("距上次保养", f"{since_maint:,} 模次")
+            if cycle:
+                m4.metric("保养周期", f"{cycle:,}",
+                          delta=("⚠️ 已到期" if since_maint >= cycle else "正常"),
+                          delta_color=("inverse" if since_maint >= cycle else "normal"))
+            else:
+                m4.metric("保养周期", "未设置")
+
+            if lifespan > 0:
+                usage = min(accumulated / lifespan, 1.0)
+                st.progress(usage)
+                st.caption(f"寿命使用率：{usage * 100:.1f}%")
+
+            # ── 模次曲线 ──
+            stroke_logs = _load_or_stop(
+                execute_query, _build_stroke_logs_query(),
+                params=(hist_mold_id,), fetch_all=True) or []
+            if stroke_logs:
+                base, points = _stroke_curve_points(accumulated, stroke_logs)
+                curve_df = pd.DataFrame(points, columns=['时间', '累计模次'])
+                fig = px.line(curve_df, x='时间', y='累计模次', markers=True,
+                              title=f"累计模次走势（建账初始 {base:,}）")
+                fig.update_layout(height=320)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("暂无模次流水（借用归还/排程完工后自动生成）。")
+
+            # ── 历史记录 ──
+            h1, h2 = st.columns(2)
+            with h1:
+                st.markdown("#### 📋 借用历史（近20条）")
+                loans = _load_or_stop(
+                    execute_query, _build_mold_loan_history_query(),
+                    params=(hist_mold_id,), fetch_all=True) or []
+                if loans:
+                    st.dataframe(pd.DataFrame(loans), hide_index=True,
+                                 use_container_width=True)
+                else:
+                    st.caption("暂无借用记录")
+            with h2:
+                st.markdown("#### 🔧 维修历史（近20条）")
+                maints = _load_or_stop(
+                    execute_query, _build_mold_maintenance_history_query(),
+                    params=(hist_mold_id,), fetch_all=True) or []
+                if maints:
+                    st.dataframe(pd.DataFrame(maints), hide_index=True,
+                                 use_container_width=True)
+                else:
+                    st.caption("暂无维修记录")
+
+            st.markdown("#### 🔩 部件清单")
+            parts = _load_or_stop(
+                execute_query, _build_mold_parts_query(),
+                params=(hist_mold_id,), fetch_all=True) or []
+            if parts:
+                st.dataframe(pd.DataFrame(parts), hide_index=True,
+                             use_container_width=True)
+            else:
+                st.caption("暂无部件记录")
+
+            with st.expander("📑 模次流水明细"):
+                if stroke_logs:
+                    flow_df = pd.DataFrame(stroke_logs)
+                    flow_df['来源'] = flow_df['来源'].map(
+                        lambda s: _STROKE_SOURCE_LABELS.get(s, s))
+                    st.dataframe(flow_df.iloc[::-1], hide_index=True,
+                                 use_container_width=True)
+                else:
+                    st.caption("暂无流水")

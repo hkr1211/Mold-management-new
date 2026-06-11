@@ -30,6 +30,10 @@ def _build_st_mock(session_state: dict) -> types.ModuleType:
     st.info = lambda *a, **kw: None
     st.success = lambda *a, **kw: None
     st.markdown = lambda *a, **kw: None
+    st.plotly_chart = lambda *a, **kw: None
+    st.progress = lambda *a, **kw: None
+    st.divider = lambda *a, **kw: None
+    st.metric = lambda *a, **kw: None
     st.subheader = lambda *a, **kw: None
     st.caption = lambda *a, **kw: None
     st.dataframe = lambda *a, **kw: None
@@ -58,6 +62,14 @@ def _load_page(st_mock, has_permission=None):
     import pandas as pd
     sys.modules["numpy"] = np
     sys.modules["pandas"] = pd
+
+    # 清除其它测试残留的 plotly mock 占位，强制真实导入
+    for _m in ("plotly.graph_objects", "plotly.express", "plotly"):
+        _mod = sys.modules.get(_m)
+        if _mod is not None and not getattr(_mod, "__file__", None):
+            del sys.modules[_m]
+    import plotly.express as px
+    sys.modules["plotly.express"] = px
 
     ui = types.ModuleType("utils.ui")
     ui.inject_global_css = lambda: None
