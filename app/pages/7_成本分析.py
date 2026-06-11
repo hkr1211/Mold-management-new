@@ -1,7 +1,10 @@
-# pages/8_成本分析.py
+# pages/7_成本分析.py
+#
+# 成本分析仪表板 — 全部基于真实数据（维修保养记录中登记的费用与起止时间）。
+# 2026-06-11 起移除全部演示数据：此前概览/明细/停机/优化建议为硬编码样例，
+# 会误导管理决策；cost_records 表无录入入口，不再作为数据源。
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
 import sqlite3
 from datetime import datetime, timedelta
@@ -10,474 +13,157 @@ from utils.auth import require_permission
 from utils.ui import inject_global_css, page_header
 from utils.nav import setup_sidebar
 
-@require_permission('view_reports')
-def show():
-    """成本分析主页面"""
-    inject_global_css()
-    setup_sidebar("7_成本分析.py")
-    page_header("💰", "成本分析仪表板", "维修成本 · 趋势分析 · 优化建议")
-    
-    # 时间范围选择
-    col1, col2, col3 = st.columns([2, 2, 1])
-    with col1:
-        time_range = st.selectbox(
-            "时间范围",
-            ["本月", "上月", "本季度", "本年", "自定义"],
-            key="cost_time_range"
-        )
-    
-    with col2:
-        if time_range == "自定义":
-            date_range = st.date_input(
-                "选择日期范围",
-                value=(datetime.now() - timedelta(days=30), datetime.now()),
-                key="custom_date_range"
-            )
-            start_date, end_date = date_range if len(date_range) == 2 else (date_range[0], date_range[0])
-        else:
-            start_date, end_date = get_date_range(time_range)
-    
-    with col3:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🔄 刷新数据", key="refresh_cost"):
-            st.rerun()
-    
-    # 获取成本数据
-    cost_data = get_cost_summary(start_date, end_date)
-    
-    # 显示关键指标
-    st.markdown("### 📊 成本概览")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        total_cost = cost_data['total_cost']
-        st.metric(
-            "总成本",
-            f"¥{total_cost:,.2f}",
-            delta=f"{cost_data['cost_change']:.1f}%",
-            delta_color="inverse"
-        )
-    
-    with col2:
-        maintenance_cost = cost_data['maintenance_cost']
-        st.metric(
-            "维修成本",
-            f"¥{maintenance_cost:,.2f}",
-            delta=f"{cost_data['maintenance_change']:.1f}%",
-            delta_color="inverse"
-        )
-    
-    with col3:
-        downtime_cost = cost_data['downtime_cost']
-        st.metric(
-            "停机损失",
-            f"¥{downtime_cost:,.2f}",
-            delta=f"{cost_data['downtime_change']:.1f}%",
-            delta_color="inverse"
-        )
-    
-    with col4:
-        avg_cost_per_mold = cost_data['avg_cost_per_mold']
-        st.metric(
-            "单模具平均成本",
-            f"¥{avg_cost_per_mold:,.2f}",
-            delta=f"{cost_data['avg_change']:.1f}%",
-            delta_color="inverse"
-        )
-    
-    # 详细分析标签页
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📈 成本趋势", "🔧 模具成本明细", "⏱️ 停机分析", "💡 成本优化建议"
-    ])
-    
-    with tab1:
-        show_cost_trends(start_date, end_date)
-    
-    with tab2:
-        show_mold_cost_details(start_date, end_date)
-    
-    with tab3:
-        show_downtime_analysis(start_date, end_date)
-    
-    with tab4:
-        show_cost_optimization_suggestions()
+# 费用/停机的归属日期：优先取保养结束时间，其次开始时间，最后记录创建时间
+_COST_DATE_EXPR = "DATE(COALESCE(ml.maintenance_end_timestamp, ml.maintenance_start_timestamp, ml.created_at))"
 
-def show_cost_trends(start_date, end_date):
-    """显示成本趋势"""
-    st.subheader("📈 成本趋势分析")
-    
-    # 获取趋势数据
-    trend_data = get_cost_trend_data(start_date, end_date)
-    
-    if trend_data:
-        df = pd.DataFrame(trend_data)
-        
-        # 成本趋势图
-        fig = go.Figure()
-        
-        # 添加各类成本趋势线
-        fig.add_trace(go.Scatter(
-            x=df['date'],
-            y=df['maintenance_cost'],
-            mode='lines+markers',
-            name='维修成本',
-            line=dict(color='#FF6B6B', width=3),
-            marker=dict(size=8)
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=df['date'],
-            y=df['downtime_cost'],
-            mode='lines+markers',
-            name='停机损失',
-            line=dict(color='#4ECDC4', width=3),
-            marker=dict(size=8)
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=df['date'],
-            y=df['total_cost'],
-            mode='lines+markers',
-            name='总成本',
-            line=dict(color='#764BA2', width=3, dash='dash'),
-            marker=dict(size=8)
-        ))
-        
-        fig.update_layout(
-            title='成本趋势图',
-            xaxis_title='日期',
-            yaxis_title='成本 (元)',
-            hovermode='x unified',
-            showlegend=True,
-            height=400
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # 成本构成饼图
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # 当期成本构成
-            current_composition = get_cost_composition(start_date, end_date)
-            
-            fig_pie = px.pie(
-                values=current_composition['values'],
-                names=current_composition['names'],
-                title='成本构成分析',
-                color_discrete_map={
-                    '维修成本': '#FF6B6B',
-                    '停机损失': '#4ECDC4',
-                    '材料成本': '#FFE66D',
-                    '其他成本': '#95A99C'
-                }
-            )
-            
-            st.plotly_chart(fig_pie, use_container_width=True)
-        
-        with col2:
-            # 成本占比变化
-            st.markdown("**成本占比变化**")
-            
-            for item in current_composition['changes']:
-                change_icon = "📈" if item['change'] > 0 else "📉"
-                color = "red" if item['change'] > 0 else "green"
-                
-                st.markdown(
-                    f"{change_icon} **{item['name']}**: "
-                    f"{item['percentage']:.1f}% "
-                    f"(<span style='color:{color}'>{item['change']:+.1f}%</span>)",
-                    unsafe_allow_html=True
-                )
-    else:
-        st.info("暂无成本趋势数据")
 
-def show_mold_cost_details(start_date, end_date):
-    """显示模具成本明细"""
-    st.subheader("🔧 模具成本明细")
-    
-    # 筛选条件
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        cost_type_filter = st.selectbox(
-            "成本类型",
-            ["全部", "维修成本", "停机损失", "材料成本"],
-            key="cost_type_filter"
-        )
-    
-    with col2:
-        sort_by = st.selectbox(
-            "排序方式",
-            ["总成本降序", "总成本升序", "使用率降序", "维修次数降序"],
-            key="cost_sort"
-        )
-    
-    with col3:
-        top_n = st.number_input("显示前N个", min_value=5, max_value=50, value=10)
-    
-    # 获取模具成本数据
-    mold_costs = get_mold_cost_details(start_date, end_date, cost_type_filter, sort_by, top_n)
-    
-    if mold_costs:
-        # 创建成本排行图
-        df = pd.DataFrame(mold_costs)
-        
-        fig = px.bar(
-            df,
-            x='total_cost',
-            y='mold_name',
-            orientation='h',
-            color='cost_per_use',
-            color_continuous_scale='Reds',
-            title=f'模具成本排行 (前{top_n}名)',
-            labels={
-                'total_cost': '总成本 (元)',
-                'mold_name': '模具名称',
-                'cost_per_use': '单次使用成本'
-            }
-        )
-        
-        fig.update_layout(height=400 + len(mold_costs) * 30)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # 详细表格
-        st.markdown("### 📋 成本明细表")
-        
-        # 格式化数据
-        df['维修成本'] = df['maintenance_cost'].apply(lambda x: f"¥{x:,.2f}")
-        df['停机损失'] = df['downtime_cost'].apply(lambda x: f"¥{x:,.2f}")
-        df['总成本'] = df['total_cost'].apply(lambda x: f"¥{x:,.2f}")
-        df['单次成本'] = df['cost_per_use'].apply(lambda x: f"¥{x:,.2f}")
-        df['成本占比'] = df['cost_percentage'].apply(lambda x: f"{x:.1f}%")
-        
-        # 选择显示列
-        display_columns = [
-            'mold_code', 'mold_name', '维修成本', '停机损失', 
-            '总成本', '单次成本', '成本占比', 'maintenance_count'
-        ]
-        
-        st.dataframe(
-            df[display_columns],
-            column_config={
-                'mold_code': '模具编号',
-                'mold_name': '模具名称',
-                'maintenance_count': st.column_config.NumberColumn(
-                    '维修次数',
-                    format="%d 次"
-                )
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-        
-        # 导出功能
-        csv = df[display_columns].to_csv(index=False, encoding='utf-8-sig')
-        st.download_button(
-            "📥 导出成本明细",
-            csv,
-            f"模具成本明细_{datetime.now().strftime('%Y%m%d')}.csv",
-            "text/csv"
-        )
-    else:
-        st.info("暂无成本数据")
+# ── SQL 构建（全部聚合自 mold_maintenance_logs，可独立测试）──────────
+def _build_cost_summary_query():
+    return f"""
+    SELECT
+        COALESCE(SUM(ml.cost), 0) AS total_cost,
+        COUNT(*) AS maintenance_count,
+        COUNT(DISTINCT ml.mold_id) AS mold_count
+    FROM mold_maintenance_logs ml
+    WHERE {_COST_DATE_EXPR} BETWEEN %s AND %s
+    """
 
-def show_downtime_analysis(start_date, end_date):
-    """停机分析"""
-    st.subheader("⏱️ 停机损失分析")
-    
-    # 获取停机数据
-    downtime_data = get_downtime_analysis(start_date, end_date)
-    
-    if downtime_data:
-        # 停机统计
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.metric("总停机时长", f"{downtime_data['total_hours']:.1f} 小时")
-        
-        with col2:
-            st.metric("停机次数", f"{downtime_data['count']} 次")
-        
-        with col3:
-            st.metric("平均停机时长", f"{downtime_data['avg_hours']:.1f} 小时/次")
-        
-        with col4:
-            st.metric("停机损失率", f"{downtime_data['loss_rate']:.1f}%")
-        
-        st.markdown("---")
-        
-        # 停机原因分析
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # 停机原因分布
-            reasons_df = pd.DataFrame(downtime_data['reasons'])
-            
-            fig = px.pie(
-                reasons_df,
-                values='hours',
-                names='reason',
-                title='停机原因分布',
-                color_discrete_sequence=px.colors.qualitative.Set3
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # 停机时间分布
-            st.markdown("**停机时间TOP 5**")
-            
-            top_downtimes = downtime_data['top_downtimes'][:5]
-            
-            for idx, dt in enumerate(top_downtimes, 1):
-                st.markdown(f"""
-                **{idx}. {dt['mold_name']}**
-                - 停机时长: {dt['hours']:.1f} 小时
-                - 损失金额: ¥{dt['cost']:,.2f}
-                - 停机原因: {dt['reason']}
-                - 发生时间: {dt['date']}
-                """)
-                
-                if idx < len(top_downtimes):
-                    st.markdown("---")
-        
-        # 停机趋势图
-        st.markdown("### 📊 停机趋势分析")
-        
-        trend_df = pd.DataFrame(downtime_data['trend'])
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Bar(
-            x=trend_df['date'],
-            y=trend_df['hours'],
-            name='停机时长',
-            yaxis='y',
-            marker_color='#FF6B6B'
-        ))
-        
-        fig.add_trace(go.Scatter(
-            x=trend_df['date'],
-            y=trend_df['cost'],
-            mode='lines+markers',
-            name='停机损失',
-            yaxis='y2',
-            line=dict(color='#4ECDC4', width=3)
-        ))
-        
-        fig.update_layout(
-            title='停机时长与损失趋势',
-            xaxis_title='日期',
-            yaxis=dict(
-                title='停机时长 (小时)',
-                side='left'
-            ),
-            yaxis2=dict(
-                title='停机损失 (元)',
-                side='right',
-                overlaying='y'
-            ),
-            hovermode='x unified',
-            height=400
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # 预防建议
-        st.markdown("### 💡 减少停机的建议")
-        
-        suggestions = generate_downtime_reduction_suggestions(downtime_data)
-        
-        for suggestion in suggestions:
-            st.info(f"• {suggestion}")
-    else:
-        st.info("暂无停机数据")
 
-def show_cost_optimization_suggestions():
-    """成本优化建议"""
-    st.subheader("💡 成本优化建议")
-    
-    # 获取优化建议数据
-    optimization_data = get_optimization_suggestions()
-    
-    if optimization_data:
-        # 潜在节省金额
-        potential_savings = optimization_data['potential_savings']
-        
-        st.markdown(
-            f"<div class='saving-metric'>潜在年度节省: ¥{potential_savings:,.2f}</div>",
-            unsafe_allow_html=True
-        )
-        
-        st.markdown("---")
-        
-        # 优化建议列表
-        for idx, suggestion in enumerate(optimization_data['suggestions'], 1):
-            with st.expander(f"{suggestion['priority_icon']} {suggestion['title']}", 
-                           expanded=(idx <= 3)):
-                
-                col1, col2 = st.columns([3, 1])
-                
-                with col1:
-                    st.markdown(f"**问题描述**: {suggestion['problem']}")
-                    st.markdown(f"**建议措施**: {suggestion['solution']}")
-                    st.markdown(f"**预期效果**: {suggestion['expected_result']}")
-                
-                with col2:
-                    st.metric(
-                        "预计节省",
-                        f"¥{suggestion['saving']:,.0f}",
-                        delta=f"{suggestion['roi']:.0f}% ROI"
-                    )
-                
-                # 实施步骤
-                if suggestion.get('steps'):
-                    st.markdown("**实施步骤**:")
-                    for step in suggestion['steps']:
-                        st.markdown(f"- {step}")
-                
-                # 相关模具
-                if suggestion.get('related_molds'):
-                    st.markdown("**相关模具**:")
-                    molds_str = ", ".join(suggestion['related_molds'][:5])
-                    if len(suggestion['related_molds']) > 5:
-                        molds_str += f" 等{len(suggestion['related_molds'])}个"
-                    st.markdown(molds_str)
-        
-        # 成本控制目标设定
-        st.markdown("### 🎯 成本控制目标")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            maintenance_target = st.number_input(
-                "月度维修成本目标 (元)",
-                min_value=0,
-                value=optimization_data.get('current_maintenance_cost', 100000),
-                step=1000
-            )
-            
-            downtime_target = st.number_input(
-                "月度停机损失目标 (元)",
-                min_value=0,
-                value=optimization_data.get('current_downtime_cost', 50000),
-                step=1000
-            )
-        
-        with col2:
-            if st.button("设定目标", type="primary"):
-                save_cost_targets(maintenance_target, downtime_target)
-                st.success("✅ 成本控制目标已设定！")
-                st.balloons()
-    else:
-        st.info("正在生成优化建议...")
+def _build_cost_trend_query():
+    return f"""
+    SELECT
+        {_COST_DATE_EXPR} AS date,
+        COALESCE(SUM(ml.cost), 0) AS total_cost,
+        COUNT(*) AS maintenance_count
+    FROM mold_maintenance_logs ml
+    WHERE {_COST_DATE_EXPR} BETWEEN %s AND %s
+    GROUP BY {_COST_DATE_EXPR}
+    ORDER BY date
+    """
 
-# 辅助函数
+
+def _build_cost_composition_query():
+    return f"""
+    SELECT
+        COALESCE(mt.type_name, '未分类') AS cost_type,
+        COALESCE(SUM(ml.cost), 0) AS total_amount,
+        COUNT(*) AS cnt
+    FROM mold_maintenance_logs ml
+    LEFT JOIN maintenance_types mt ON ml.maintenance_type_id = mt.type_id
+    WHERE {_COST_DATE_EXPR} BETWEEN %s AND %s
+    GROUP BY COALESCE(mt.type_name, '未分类')
+    ORDER BY total_amount DESC
+    """
+
+
+_MOLD_COST_SORTS = {
+    "总费用降序": "total_cost DESC",
+    "总费用升序": "total_cost ASC",
+    "维修次数降序": "maintenance_count DESC",
+}
+
+
+def _build_mold_cost_details_query(repair_filter=None, sort_by="总费用降序"):
+    """repair_filter: None=全部, 1=仅维修, 0=仅保养（maintenance_types.is_repair）"""
+    where = f"WHERE {_COST_DATE_EXPR} BETWEEN %s AND %s"
+    if repair_filter is not None:
+        where += " AND mt.is_repair = %s"
+    order = _MOLD_COST_SORTS.get(sort_by, "total_cost DESC")
+    return f"""
+    SELECT
+        m.mold_code,
+        m.mold_name,
+        COALESCE(SUM(ml.cost), 0) AS total_cost,
+        COUNT(*) AS maintenance_count,
+        COALESCE(AVG(ml.cost), 0) AS avg_cost
+    FROM mold_maintenance_logs ml
+    JOIN molds m ON ml.mold_id = m.mold_id
+    LEFT JOIN maintenance_types mt ON ml.maintenance_type_id = mt.type_id
+    {where}
+    GROUP BY ml.mold_id, m.mold_code, m.mold_name
+    ORDER BY {order}
+    LIMIT %s
+    """
+
+
+def _build_downtime_query():
+    """停机时长 = 维修起止时间差（小时）；未填写结束时间的记录不计入。"""
+    return f"""
+    SELECT
+        m.mold_code,
+        m.mold_name,
+        {_COST_DATE_EXPR} AS date,
+        (julianday(ml.maintenance_end_timestamp) - julianday(ml.maintenance_start_timestamp)) * 24 AS hours
+    FROM mold_maintenance_logs ml
+    JOIN molds m ON ml.mold_id = m.mold_id
+    WHERE ml.maintenance_start_timestamp IS NOT NULL
+      AND ml.maintenance_end_timestamp IS NOT NULL
+      AND {_COST_DATE_EXPR} BETWEEN %s AND %s
+    ORDER BY hours DESC
+    """
+
+
+# ── 数据获取 ─────────────────────────────────────────────────────────
+def get_cost_summary(start_date, end_date):
+    try:
+        row = execute_query(_build_cost_summary_query(),
+                            params=(start_date, end_date), fetch_one=True)
+    except sqlite3.Error as e:
+        st.error(f"获取成本汇总失败: {e}")
+        row = None
+    if not row:
+        return {'total_cost': 0.0, 'maintenance_count': 0, 'mold_count': 0}
+    return {
+        'total_cost': float(row.get('total_cost') or 0),
+        'maintenance_count': int(row.get('maintenance_count') or 0),
+        'mold_count': int(row.get('mold_count') or 0),
+    }
+
+
+def get_cost_trend_data(start_date, end_date):
+    try:
+        return execute_query(_build_cost_trend_query(),
+                             params=(start_date, end_date), fetch_all=True) or []
+    except sqlite3.Error as e:
+        st.error(f"获取趋势数据失败: {e}")
+        return []
+
+
+def get_cost_composition(start_date, end_date):
+    try:
+        return execute_query(_build_cost_composition_query(),
+                             params=(start_date, end_date), fetch_all=True) or []
+    except sqlite3.Error as e:
+        st.error(f"获取成本构成失败: {e}")
+        return []
+
+
+def get_mold_cost_details(start_date, end_date, repair_filter, sort_by, top_n):
+    query = _build_mold_cost_details_query(repair_filter, sort_by)
+    params = [start_date, end_date]
+    if repair_filter is not None:
+        params.append(repair_filter)
+    params.append(int(top_n))
+    try:
+        return execute_query(query, params=tuple(params), fetch_all=True) or []
+    except sqlite3.Error as e:
+        st.error(f"获取模具成本明细失败: {e}")
+        return []
+
+
+def get_downtime_records(start_date, end_date):
+    try:
+        return execute_query(_build_downtime_query(),
+                             params=(start_date, end_date), fetch_all=True) or []
+    except sqlite3.Error as e:
+        st.error(f"获取停机数据失败: {e}")
+        return []
+
+
 def get_date_range(time_range):
     """获取时间范围"""
     today = datetime.now().date()
-    
+
     if time_range == "本月":
         start_date = today.replace(day=1)
         end_date = today
@@ -495,228 +181,245 @@ def get_date_range(time_range):
     else:
         start_date = today - timedelta(days=30)
         end_date = today
-    
+
     return start_date, end_date
 
-def get_cost_summary(start_date, end_date):
-    """获取成本汇总数据"""
-    # 实际实现需要从数据库查询
-    # 这里返回示例数据
-    return {
-        'total_cost': 158000.00,
-        'maintenance_cost': 68000.00,
-        'downtime_cost': 45000.00,
-        'avg_cost_per_mold': 3200.00,
-        'cost_change': -12.5,
-        'maintenance_change': -8.3,
-        'downtime_change': -15.2,
-        'avg_change': -10.1
-    }
+
+def _previous_period(start_date, end_date):
+    """上一个等长周期，用于环比。"""
+    length = (end_date - start_date)
+    prev_end = start_date - timedelta(days=1)
+    prev_start = prev_end - length
+    return prev_start, prev_end
 
 
-def _build_cost_trend_query():
-    """构建兼容 SQLite 的成本趋势查询"""
-    return """
-    SELECT
-        strftime('%Y-%m-%d', record_date) as date,
-        SUM(CASE WHEN cost_type = '维修成本' THEN amount ELSE 0 END) as maintenance_cost,
-        SUM(CASE WHEN cost_type = '停机损失' THEN amount ELSE 0 END) as downtime_cost,
-        SUM(amount) as total_cost
-    FROM cost_records
-    WHERE record_date BETWEEN %s AND %s
-    GROUP BY strftime('%Y-%m-%d', record_date)
-    ORDER BY date
-    """
+def _pct_change(current, previous):
+    """环比变化百分比；上期无数据返回 None（不显示）。"""
+    if previous and previous > 0:
+        return (current - previous) / previous * 100
+    return None
 
 
-def _build_cost_composition_query():
-    """构建兼容当前 SQLite schema 的成本构成查询"""
-    return """
-    SELECT
-        cost_type,
-        SUM(amount) as total_amount
-    FROM cost_records
-    WHERE record_date BETWEEN %s AND %s
-    GROUP BY cost_type
-    """
+# ── 页面 ─────────────────────────────────────────────────────────────
+@require_permission('view_reports')
+def show():
+    """成本分析主页面"""
+    inject_global_css()
+    setup_sidebar("7_成本分析.py")
+    page_header("💰", "成本分析仪表板", "维修保养费用 · 停机时长 · 真实数据")
+    st.caption("📌 数据来源：维修保养记录中登记的费用与起止时间。请在维修管理中如实填写费用，分析才有意义。")
 
-def get_cost_trend_data(start_date, end_date):
-    """获取成本趋势数据"""
-    query = _build_cost_trend_query()
-    
-    try:
-        results = execute_query(query, params=(start_date, end_date), fetch_all=True)
-        return [dict(r) for r in results] if results else []
-    except sqlite3.Error as e:
-        st.error(f"获取趋势数据失败: {e}")
-        return []
+    # 时间范围选择
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        time_range = st.selectbox(
+            "时间范围",
+            ["本月", "上月", "本季度", "本年", "自定义"],
+            key="cost_time_range"
+        )
 
-def get_cost_composition(start_date, end_date):
-    """获取成本构成"""
-    query = _build_cost_composition_query()
-    
-    try:
-        results = execute_query(query, params=(start_date, end_date), fetch_all=True)
-        
-        if results:
-            total = sum(r['total_amount'] for r in results)
-            
-            return {
-                'names': [r['cost_type'] for r in results],
-                'values': [r['total_amount'] for r in results],
-                'changes': [
-                    {
-                        'name': r['cost_type'],
-                        'percentage': (r['total_amount'] / total * 100) if total > 0 else 0,
-                        'change': -5.2  # 示例数据，实际需要计算
-                    }
-                    for r in results
-                ]
-            }
-        return {'names': [], 'values': [], 'changes': []}
-    except sqlite3.Error as e:
-        st.error(f"获取成本构成失败: {e}")
-        return {'names': [], 'values': [], 'changes': []}
+    with col2:
+        if time_range == "自定义":
+            date_range = st.date_input(
+                "选择日期范围",
+                value=(datetime.now().date() - timedelta(days=30), datetime.now().date()),
+                key="custom_date_range"
+            )
+            if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+                start_date, end_date = date_range
+            else:
+                start_date = end_date = (date_range[0] if isinstance(date_range, (list, tuple)) else date_range)
+        else:
+            start_date, end_date = get_date_range(time_range)
 
-def get_mold_cost_details(start_date, end_date, cost_type_filter, sort_by, top_n):
-    """获取模具成本明细"""
-    # 实际实现需要复杂的SQL查询
-    # 返回示例数据
-    sample_data = []
-    for i in range(top_n):
-        sample_data.append({
-            'mold_code': f'LM{str(i+1).zfill(3)}',
-            'mold_name': f'Φ{30+i*5}钛平底杯-落料模',
-            'maintenance_cost': 5000 + i * 1000,
-            'downtime_cost': 3000 + i * 500,
-            'total_cost': 8000 + i * 1500,
-            'maintenance_count': 3 + i % 3,
-            'cost_per_use': (8000 + i * 1500) / (1000 + i * 100),
-            'cost_percentage': (8000 + i * 1500) / 158000 * 100
-        })
-    
-    return sample_data
+    with col3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 刷新数据", key="refresh_cost"):
+            st.rerun()
 
-def get_downtime_analysis(start_date, end_date):
-    """获取停机分析数据"""
-    # 返回示例数据
-    return {
-        'total_hours': 156.5,
-        'count': 23,
-        'avg_hours': 6.8,
-        'loss_rate': 3.2,
-        'reasons': [
-            {'reason': '模具故障', 'hours': 65.5, 'percentage': 41.9},
-            {'reason': '计划保养', 'hours': 38.0, 'percentage': 24.3},
-            {'reason': '更换部件', 'hours': 28.0, 'percentage': 17.9},
-            {'reason': '其他原因', 'hours': 25.0, 'percentage': 16.0}
-        ],
-        'top_downtimes': [
-            {
-                'mold_name': 'LM001-Φ50钛平底杯',
-                'hours': 18.5,
-                'cost': 12500,
-                'reason': '压边圈严重磨损',
-                'date': '2024-05-15'
-            },
-            {
-                'mold_name': 'YS201-Φ50钛平底杯-二引模',
-                'hours': 15.0,
-                'cost': 10000,
-                'reason': '模具精度调整',
-                'date': '2024-05-20'
-            }
-        ],
-        'trend': [
-            {'date': '2024-05-01', 'hours': 8.5, 'cost': 5500},
-            {'date': '2024-05-08', 'hours': 12.0, 'cost': 8000},
-            {'date': '2024-05-15', 'hours': 18.5, 'cost': 12500},
-            {'date': '2024-05-22', 'hours': 6.0, 'cost': 4000}
-        ]
-    }
+    # 概览指标（真实聚合 + 与上一等长周期环比）
+    summary = get_cost_summary(start_date, end_date)
+    prev_start, prev_end = _previous_period(start_date, end_date)
+    prev = get_cost_summary(prev_start, prev_end)
 
-def generate_downtime_reduction_suggestions(downtime_data):
-    """生成减少停机的建议"""
-    suggestions = []
-    
-    # 基于数据生成建议
-    if downtime_data['avg_hours'] > 5:
-        suggestions.append("建立快速维修响应机制，配备常用备件库存，减少等待时间")
-    
-    # 检查主要原因
-    top_reason = downtime_data['reasons'][0]
-    if top_reason['reason'] == '模具故障' and top_reason['percentage'] > 40:
-        suggestions.append("加强预防性维护，建立模具健康监测系统，提前发现潜在问题")
-    
-    if downtime_data['loss_rate'] > 3:
-        suggestions.append("优化生产排程，将维护保养安排在非生产高峰期")
-    
-    suggestions.append("建立模具备用机制，关键模具准备备用件")
-    suggestions.append("加强操作工培训，减少因操作不当导致的模具损坏")
-    
-    return suggestions
+    st.markdown("### 📊 费用概览")
+    c1, c2, c3, c4 = st.columns(4)
 
-def get_optimization_suggestions():
-    """获取成本优化建议"""
-    # 实际实现需要基于数据分析
-    return {
-        'potential_savings': 235000,
-        'current_maintenance_cost': 120000,
-        'current_downtime_cost': 80000,
-        'suggestions': [
-            {
-                'priority_icon': '🔴',
-                'title': '优化高成本模具维修策略',
-                'problem': '5个模具占总维修成本的45%，维修频率异常高',
-                'solution': '对这5个模具进行全面检修或考虑更换，建立专门维护计划',
-                'expected_result': '预计降低30%的维修频率',
-                'saving': 45000,
-                'roi': 150,
-                'steps': [
-                    '识别高成本模具清单',
-                    '分析故障根本原因',
-                    '制定专项改善计划',
-                    '实施并跟踪效果'
-                ],
-                'related_molds': ['LM001', 'LM002', 'YS201', 'YS202', 'QM001']
-            },
-            {
-                'priority_icon': '🟡',
-                'title': '建立预测性维护体系',
-                'problem': '目前主要是事后维修，导致突发停机多',
-                'solution': '基于使用数据建立维护预测模型，提前安排保养',
-                'expected_result': '减少60%的突发停机',
-                'saving': 35000,
-                'roi': 200,
-                'steps': [
-                    '收集历史维修数据',
-                    '建立预测模型',
-                    '制定预防性维护计划',
-                    '培训维护人员'
-                ]
-            },
-            {
-                'priority_icon': '🟢',
-                'title': '优化备件管理',
-                'problem': '关键备件缺货导致维修等待时间长',
-                'solution': '建立智能备件库存管理系统',
-                'expected_result': '减少50%的等待时间',
-                'saving': 25000,
-                'roi': 120,
-                'steps': [
-                    '分析备件使用频率',
-                    '设定安全库存',
-                    '建立补货机制'
-                ]
-            }
-        ]
-    }
+    cost_change = _pct_change(summary['total_cost'], prev['total_cost'])
+    with c1:
+        st.metric(
+            "维修保养总费用",
+            f"¥{summary['total_cost']:,.2f}",
+            delta=(f"{cost_change:+.1f}% 环比" if cost_change is not None else None),
+            delta_color="inverse"
+        )
+    with c2:
+        cnt_change = _pct_change(summary['maintenance_count'], prev['maintenance_count'])
+        st.metric(
+            "维修保养次数",
+            f"{summary['maintenance_count']} 次",
+            delta=(f"{cnt_change:+.1f}% 环比" if cnt_change is not None else None),
+            delta_color="inverse"
+        )
+    with c3:
+        st.metric("涉及模具数", f"{summary['mold_count']} 个")
+    with c4:
+        avg = (summary['total_cost'] / summary['maintenance_count']
+               if summary['maintenance_count'] else 0)
+        st.metric("单次平均费用", f"¥{avg:,.2f}")
 
-def save_cost_targets(maintenance_target, downtime_target):
-    """保存成本目标"""
-    # 实际实现需要保存到数据库
-    from utils.auth import log_user_action
-    log_user_action('SET_COST_TARGET', 'cost_management', 
-                   f"maintenance:{maintenance_target},downtime:{downtime_target}")
+    tab1, tab2, tab3 = st.tabs(["📈 费用趋势", "🔧 模具费用明细", "⏱️ 停机时长"])
+
+    with tab1:
+        show_cost_trends(start_date, end_date)
+
+    with tab2:
+        show_mold_cost_details(start_date, end_date)
+
+    with tab3:
+        show_downtime_analysis(start_date, end_date)
+
+
+def show_cost_trends(start_date, end_date):
+    """费用趋势与构成"""
+    st.subheader("📈 费用趋势")
+
+    trend_data = get_cost_trend_data(start_date, end_date)
+    if not trend_data:
+        st.info("所选时间范围内暂无维修保养费用记录。")
+        return
+
+    df = pd.DataFrame(trend_data)
+    fig = px.line(
+        df, x='date', y='total_cost', markers=True,
+        title='维修保养费用日趋势',
+        labels={'date': '日期', 'total_cost': '费用 (元)'}
+    )
+    fig.update_layout(height=380, hovermode='x unified')
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 按维修类型的费用构成
+    composition = get_cost_composition(start_date, end_date)
+    if composition:
+        col1, col2 = st.columns(2)
+        comp_df = pd.DataFrame(composition)
+        with col1:
+            fig_pie = px.pie(
+                comp_df, values='total_amount', names='cost_type',
+                title='费用构成（按维修类型）'
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+        with col2:
+            st.markdown("**各类型明细**")
+            total = comp_df['total_amount'].sum()
+            for _, row in comp_df.iterrows():
+                pct = (row['total_amount'] / total * 100) if total > 0 else 0
+                st.markdown(
+                    f"- **{row['cost_type']}**：¥{row['total_amount']:,.2f}"
+                    f"（{pct:.1f}% · {row['cnt']} 次）"
+                )
+
+
+def show_mold_cost_details(start_date, end_date):
+    """模具费用明细（按模具聚合维修保养费用）"""
+    st.subheader("🔧 模具费用明细")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        type_filter = st.selectbox(
+            "类型", ["全部", "仅维修", "仅保养"], key="cost_type_filter"
+        )
+    with col2:
+        sort_by = st.selectbox("排序方式", list(_MOLD_COST_SORTS.keys()), key="cost_sort")
+    with col3:
+        top_n = st.number_input("显示前N个", min_value=5, max_value=50, value=10)
+
+    repair_filter = {"全部": None, "仅维修": 1, "仅保养": 0}[type_filter]
+    mold_costs = get_mold_cost_details(start_date, end_date, repair_filter, sort_by, top_n)
+
+    if not mold_costs:
+        st.info("所选条件下暂无费用记录。")
+        return
+
+    df = pd.DataFrame(mold_costs)
+
+    fig = px.bar(
+        df, x='total_cost', y='mold_name', orientation='h',
+        title=f'模具维修保养费用排行（前{len(df)}名）',
+        labels={'total_cost': '总费用 (元)', 'mold_name': '模具名称'}
+    )
+    fig.update_layout(height=300 + len(df) * 28)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("### 📋 明细表")
+    show_df = df.copy()
+    show_df['总费用'] = show_df['total_cost'].apply(lambda x: f"¥{x:,.2f}")
+    show_df['单次平均'] = show_df['avg_cost'].apply(lambda x: f"¥{x:,.2f}")
+    st.dataframe(
+        show_df[['mold_code', 'mold_name', '总费用', 'maintenance_count', '单次平均']],
+        column_config={
+            'mold_code': '模具编号',
+            'mold_name': '模具名称',
+            'maintenance_count': '维修保养次数',
+        },
+        hide_index=True,
+        use_container_width=True
+    )
+
+    csv = show_df[['mold_code', 'mold_name', '总费用', 'maintenance_count', '单次平均']].to_csv(
+        index=False, encoding='utf-8-sig')
+    st.download_button(
+        "📥 导出费用明细",
+        csv,
+        f"模具费用明细_{datetime.now().strftime('%Y%m%d')}.csv",
+        "text/csv"
+    )
+
+
+def show_downtime_analysis(start_date, end_date):
+    """停机时长分析（按维修记录起止时间计算）"""
+    st.subheader("⏱️ 停机时长分析")
+    st.caption("停机时长按维修保养记录的起止时间计算；未填写结束时间的记录不计入。")
+
+    records = get_downtime_records(start_date, end_date)
+    if not records:
+        st.info("所选时间范围内暂无可计算的停机记录（需同时填写开始与结束时间）。")
+        return
+
+    df = pd.DataFrame(records)
+    df['hours'] = df['hours'].astype(float).clip(lower=0)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("总停机时长", f"{df['hours'].sum():.1f} 小时")
+    with c2:
+        st.metric("停机次数", f"{len(df)} 次")
+    with c3:
+        st.metric("平均停机时长", f"{df['hours'].mean():.1f} 小时/次")
+
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**停机时长 TOP 5（按模具）**")
+        top_molds = (df.groupby(['mold_code', 'mold_name'])['hours']
+                       .agg(['sum', 'count']).reset_index()
+                       .sort_values('sum', ascending=False).head(5))
+        for _, row in top_molds.iterrows():
+            st.markdown(
+                f"- **{row['mold_code']}** {row['mold_name']}："
+                f"{row['sum']:.1f} 小时（{int(row['count'])} 次）"
+            )
+
+    with col2:
+        daily = df.groupby('date')['hours'].sum().reset_index()
+        fig = px.bar(
+            daily, x='date', y='hours',
+            title='停机时长日分布',
+            labels={'date': '日期', 'hours': '停机时长 (小时)'}
+        )
+        fig.update_layout(height=320)
+        st.plotly_chart(fig, use_container_width=True)
+
 
 show()
