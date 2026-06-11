@@ -41,6 +41,7 @@ def _load_loan_module():
     database = types.ModuleType("utils.database")
     database.execute_query = lambda *a, **kw: []
     database.add_mold_strokes = lambda *a, **kw: (True, "ok")
+    database.get_storage_locations = lambda *a, **kw: []
     database.get_db_connection = lambda *a, **kw: None
     database.get_loan_statuses = lambda *a, **kw: []
     database.convert_numpy_types = lambda x: x
@@ -100,3 +101,38 @@ def test_format_loan_datetime_accepts_string():
     module = _load_loan_module()
 
     assert module._format_loan_datetime("2026-05-01 10:20:30", "%Y-%m-%d %H:%M") == "2026-05-01 10:20"
+
+
+def test_build_loan_list_query_applicant_filter():
+    """操作工"我的申请"按申请人过滤；与状态筛选可组合。"""
+    module = _load_loan_module()
+
+    q, params = module._build_loan_list_query(0, applicant_id=7)
+    assert "mlr.applicant_id = %s" in q
+    assert params == [7]
+
+    q2, params2 = module._build_loan_list_query(3, applicant_id=7)
+    assert "mlr.loan_status_id = %s" in q2
+    assert "mlr.applicant_id = %s" in q2
+    assert params2 == [3, 7]
+
+    # 不传 applicant_id 行为不变（管理员看全部）
+    q3, params3 = module._build_loan_list_query(0)
+    assert "applicant_id = %s" not in q3
+    assert params3 == []
+
+
+def test_overdue_days():
+    """逾期判定：仅"已借出"且超过预计归还日才算逾期。"""
+    module = _load_loan_module()
+
+    assert module._overdue_days(
+        {"loan_status": "已借出", "expected_return_timestamp": "2000-01-01"}) > 0
+    assert module._overdue_days(
+        {"loan_status": "已借出", "expected_return_timestamp": "2999-01-01"}) == 0
+    assert module._overdue_days(
+        {"loan_status": "已归还", "expected_return_timestamp": "2000-01-01"}) == 0
+    assert module._overdue_days(
+        {"loan_status": "已借出", "expected_return_timestamp": None}) == 0
+    assert module._overdue_days(
+        {"loan_status": "已借出", "expected_return_timestamp": "garbage"}) == 0

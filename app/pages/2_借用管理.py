@@ -9,6 +9,7 @@ from utils.database import (
     execute_query,
     get_db_connection,
     get_loan_statuses,
+    get_storage_locations,
     convert_numpy_types,
     add_mold_strokes
 )
@@ -29,6 +30,23 @@ def _format_loan_datetime(value, fmt='%Y-%m-%d %H:%M', default='N/A'):
         return str(value)
 
 
+def _overdue_days(record):
+    """已借出且超过预计归还日期的天数；未逾期或无法判断返回 0。"""
+    if record.get('loan_status') != '已借出':
+        return 0
+    expected = record.get('expected_return_timestamp')
+    if expected is None or (isinstance(expected, str) and not expected.strip()):
+        return 0
+    try:
+        if pd.isna(expected):
+            return 0
+        expected_dt = pd.to_datetime(expected)
+    except Exception:
+        return 0
+    delta = pd.Timestamp.now().normalize() - expected_dt.normalize()
+    return max(int(delta.days), 0)
+
+
 def _map_legacy_loan_field(field_name):
     """将旧版借用字段映射到当前 SQLite schema"""
     mapping = {
@@ -42,8 +60,11 @@ def _map_legacy_loan_field(field_name):
     return mapping.get(field_name, field_name)
 
 
-def _build_loan_list_query(selected_status_id):
-    """构建兼容当前 SQLite schema 的借用申请列表查询"""
+def _build_loan_list_query(selected_status_id, applicant_id=None):
+    """构建兼容当前 SQLite schema 的借用申请列表查询。
+
+    applicant_id 不为 None 时仅返回该申请人的记录（操作工"我的申请"）。
+    """
     query = """
     SELECT
         mlr.loan_id,
@@ -67,9 +88,15 @@ def _build_loan_list_query(selected_status_id):
     """
 
     params = []
+    conditions = []
     if selected_status_id != 0:
-        query += " WHERE mlr.loan_status_id = %s"
+        conditions.append("mlr.loan_status_id = %s")
         params.append(selected_status_id)
+    if applicant_id is not None:
+        conditions.append("mlr.applicant_id = %s")
+        params.append(applicant_id)
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
 
     query += " ORDER BY mlr.application_date DESC"
     return query, params
@@ -441,31 +468,30 @@ def view_loan_applications():
         st.warning("请先登录。")
         return
 
+    # 操作工只能看到自己的申请；库管/管理员可见全部
+    is_operator = current_user_role == '冲压操作工'
+    applicant_filter = current_user_id if is_operator else None
+    if is_operator:
+        st.caption("📌 仅显示您本人提交的申请")
+
     # 状态筛选
     try:
-        # 获取所有状态，包括调试信息
-        all_statuses_result = execute_query("SELECT status_id, status_name FROM loan_statuses ORDER BY status_id", fetch_all=True)
-        
+        all_statuses_result = execute_query(
+            "SELECT status_id, status_name FROM loan_statuses ORDER BY status_id",
+            fetch_all=True)
+
         if not all_statuses_result:
             st.error("无法获取借用状态列表。请联系管理员检查数据库配置。")
             return
-        
-        # 显示调试信息（可选）
-        with st.expander("🔧 调试信息", expanded=False):
-            st.write("数据库中的所有借用状态:")
-            for status in all_statuses_result:
-                st.write(f"- ID: {status['status_id']}, 名称: '{status['status_name']}'")
-            
+
         status_filter_options = {0: "全部状态"}
         for status in all_statuses_result:
-            status_id = status['status_id'] if isinstance(status, dict) else status[0]
-            status_name = status['status_name'] if isinstance(status, dict) else status[1]
-            status_filter_options[status_id] = status_name
-        
+            status_filter_options[status['status_id']] = status['status_name']
+
     except sqlite3.Error as e:
         st.error(f"获取状态列表失败：{e}")
         return
-    
+
     selected_status_id = st.selectbox(
         "按状态筛选:",
         options=list(status_filter_options.keys()),
@@ -473,29 +499,13 @@ def view_loan_applications():
         key="loan_status_filter"
     )
 
-    # 获取借用申请数据 - 修复查询
+    # 获取借用申请数据
     try:
-        query_base, params = _build_loan_list_query(selected_status_id)
-        
-        # 执行查询并显示调试信息
-        st.write(f"🔍 执行查询，状态ID筛选: {selected_status_id if selected_status_id != 0 else '全部'}")
-        
+        query_base, params = _build_loan_list_query(selected_status_id, applicant_filter)
         loan_apps_result = execute_query(query_base, params=tuple(params), fetch_all=True)
-        
-        # 显示查询结果统计
-        if loan_apps_result:
-            st.success(f"✅ 找到 {len(loan_apps_result)} 条记录")
-        else:
+
+        if not loan_apps_result:
             st.info("📋 没有找到符合条件的借用申请记录")
-            
-            # 如果筛选条件下没有记录，显示所有记录用于调试
-            if selected_status_id != 0:
-                st.write("🔧 显示所有记录用于调试:")
-                all_query, all_params = _build_loan_list_query(0)
-                all_records = execute_query(all_query, params=tuple(all_params), fetch_all=True)
-                if all_records:
-                    for record in all_records:
-                        st.write(f"- 申请ID: {record.get('loan_id')}, 状态: {record.get('loan_status')} (ID: {record.get('loan_status_id')})")
             return
 
         # 显示统计信息
@@ -503,8 +513,9 @@ def view_loan_applications():
         pending_count = len([app for app in loan_apps_result if app.get('loan_status') == '待审批'])
         approved_count = len([app for app in loan_apps_result if app.get('loan_status') in ['已批准', '已借出']])
         returned_count = len([app for app in loan_apps_result if app.get('loan_status') == '已归还'])
+        overdue_count = len([app for app in loan_apps_result if _overdue_days(app) > 0])
 
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             st.metric("总申请数", total_apps)
         with col2:
@@ -513,6 +524,8 @@ def view_loan_applications():
             st.metric("已批准/借出", approved_count)
         with col4:
             st.metric("已归还", returned_count)
+        with col5:
+            st.metric("⚠️ 逾期未还", overdue_count)
 
         # 显示申请列表
         status_emoji = {
@@ -531,8 +544,10 @@ def view_loan_applications():
             app_id = record['loan_id']
             mold_id = record['mold_id']
 
-            emoji = status_emoji.get(record['loan_status'], "📋")
-            expander_title = f"{emoji} {record['mold_code']} ({record['mold_name']}) - 申请人: {record['applicant_name']} - 状态: {record['loan_status']}"
+            overdue = _overdue_days(record)
+            emoji = "⚠️" if overdue > 0 else status_emoji.get(record['loan_status'], "📋")
+            status_text = f"{record['loan_status']}（已逾期 {overdue} 天）" if overdue > 0 else record['loan_status']
+            expander_title = f"{emoji} {record['mold_code']} ({record['mold_name']}) - 申请人: {record['applicant_name']} - 状态: {status_text}"
             
             with st.expander(expander_title):
                 details_col, actions_col = st.columns([3, 1])
@@ -552,8 +567,6 @@ def view_loan_applications():
                     if record['remarks']:
                         st.write(f"**申请备注：** {record['remarks']}")
                     
-                    # 调试信息
-                    st.write(f"🔧 **调试信息：** 状态ID: {record['loan_status_id']}, 状态名称: '{record['loan_status']}'")
                 
                 with actions_col:
                     # 权限定义
@@ -585,6 +598,17 @@ def view_loan_applications():
                         )
                         if used_strokes == 0:
                             st.caption("⚠️ 填 0 表示本次未使用（如借出检查），不累计模次")
+
+                        # 归还存放位置（避免位置数据随流转失真）
+                        loc_options = {"（保持不变）": None}
+                        for loc in get_storage_locations():
+                            loc_options[loc['location_name']] = loc['location_id']
+                        return_loc = st.selectbox(
+                            "归还存放位置", list(loc_options.keys()),
+                            key=f"loc_{app_id}",
+                            help="模具归还后实际存放的位置，选择后更新台账"
+                        )
+
                         if st.button("📥 标记归还", key=f"return_{app_id}", help="标记模具已归还"):
                             if mark_as_returned(app_id, mold_id, current_user_id):
                                 if used_strokes > 0:
@@ -596,12 +620,21 @@ def view_loan_applications():
                                     if not ok:
                                         st.error(f"⚠️ 归还成功，但模次累计失败：{msg}。"
                                                  f"请在模具管理中手动调整。")
+                                new_loc_id = loc_options.get(return_loc)
+                                if new_loc_id is not None:
+                                    try:
+                                        execute_query(
+                                            "UPDATE molds SET current_location_id = %s, "
+                                            "updated_at = NOW() WHERE mold_id = %s",
+                                            params=(new_loc_id, mold_id), commit=True
+                                        )
+                                    except sqlite3.Error as e:
+                                        st.error(f"⚠️ 归还成功，但更新存放位置失败：{e}")
                                 st.rerun()
 
     except sqlite3.Error as e:
-        logging.error(f"Failed to load loan applications: {e}")
+        logging.error(f"Failed to load loan applications: {e}", exc_info=True)
         st.error(f"加载借用申请列表失败：{e}")
-        st.exception(e)  # 显示详细错误用于调试
 
 def _update_loan_and_mold_status(loan_id, mold_id,
                                  current_loan_status_name, target_loan_status_name,
