@@ -74,24 +74,57 @@ class _DummyContext:
         return False
 
 
-def test_build_cost_trend_query_uses_sqlite_grouping():
+# 2026-06-11 成本页去假：数据源由无录入口的 cost_records 改为真实的
+# mold_maintenance_logs（维修保养记录的费用与起止时间）。
+
+def test_queries_aggregate_real_maintenance_costs():
     module = _load_cost_module()
 
-    query = module._build_cost_trend_query()
+    for builder in (module._build_cost_summary_query,
+                    module._build_cost_trend_query,
+                    module._build_cost_composition_query,
+                    module._build_downtime_query):
+        query = builder()
+        assert "mold_maintenance_logs" in query, builder.__name__
+        assert "cost_records" not in query, builder.__name__
+        assert "DATE_TRUNC" not in query, builder.__name__
 
-    assert "strftime('%Y-%m-%d', record_date) as date" in query
-    assert "WHERE record_date BETWEEN %s AND %s" in query
-    assert "GROUP BY strftime('%Y-%m-%d', record_date)" in query
-    assert "DATE_TRUNC" not in query
-    assert "cost_date" not in query
+    details = module._build_mold_cost_details_query()
+    assert "mold_maintenance_logs" in details
+    assert "cost_records" not in details
 
 
-def test_build_cost_composition_query_uses_record_date():
+def test_mold_cost_details_query_repair_filter_and_sort_whitelist():
     module = _load_cost_module()
 
-    query = module._build_cost_composition_query()
+    q_all = module._build_mold_cost_details_query(None, "总费用降序")
+    assert "is_repair" not in q_all
+    assert "ORDER BY total_cost DESC" in q_all
 
-    assert "FROM cost_records" in query
-    assert "WHERE record_date BETWEEN %s AND %s" in query
-    assert "GROUP BY cost_type" in query
-    assert "cost_date" not in query
+    q_repair = module._build_mold_cost_details_query(1, "维修次数降序")
+    assert "mt.is_repair = %s" in q_repair
+    assert "ORDER BY maintenance_count DESC" in q_repair
+
+    # 非法排序输入回落到默认排序（防注入）
+    q_bad = module._build_mold_cost_details_query(None, "evil; DROP TABLE molds")
+    assert "ORDER BY total_cost DESC" in q_bad
+    assert "DROP" not in q_bad
+
+
+def test_downtime_query_requires_both_timestamps():
+    module = _load_cost_module()
+    query = module._build_downtime_query()
+    assert "maintenance_start_timestamp IS NOT NULL" in query
+    assert "maintenance_end_timestamp IS NOT NULL" in query
+    assert "julianday" in query
+
+
+def test_no_hardcoded_demo_numbers_left_in_page():
+    """守住"去假"成果：演示数字与假功能不得回归。"""
+    page_path = os.path.join(
+        os.path.dirname(__file__), "..", "app", "pages", "7_成本分析.py")
+    with open(page_path, encoding="utf-8") as f:
+        src = f.read()
+    for fake in ("158000", "235000", "get_optimization_suggestions",
+                 "save_cost_targets", "潜在年度节省"):
+        assert fake not in src, f"演示数据/假功能回归: {fake}"

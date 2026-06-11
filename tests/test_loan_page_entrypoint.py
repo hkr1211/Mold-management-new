@@ -77,6 +77,7 @@ def _load_page(st_mock, extra_modules=None):
     database = types.ModuleType("utils.database")
     database.execute_query = lambda *a, **kw: []
     database.add_mold_strokes = lambda *a, **kw: (True, "ok")
+    database.get_storage_locations = lambda *a, **kw: []
     database.get_db_connection = lambda *a, **kw: None
     database.get_loan_statuses = lambda *a, **kw: []
     database.convert_numpy_types = lambda x: x
