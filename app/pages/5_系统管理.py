@@ -38,18 +38,21 @@ def show():
         return
 
     setup_sidebar("5_系统管理.py")
-    page_header("⚙️", "系统管理", "用户管理 · 系统配置 · 系统监控")
-    
+    page_header("⚙️", "系统管理", "用户管理 · 主数据 · 系统配置 · 系统监控")
+
     # 主导航标签
-    tab1, tab2, tab3 = st.tabs(["👥 用户管理", "🔧 系统配置", "📊 系统监控"])
-    
+    tab1, tab2, tab3, tab4 = st.tabs(["👥 用户管理", "📚 主数据", "🔧 系统配置", "📊 系统监控"])
+
     with tab1:
         show_user_management()
-    
+
     with tab2:
-        show_system_config()
-    
+        show_master_data()
+
     with tab3:
+        show_system_config()
+
+    with tab4:
         show_system_monitor()
 
 # ===================== 用户管理部分 =====================
@@ -679,6 +682,202 @@ def show_activity_logs():
             )
     else:
         st.info("😊 没有找到符合条件的操作日志")
+
+# ===================== 主数据维护部分 =====================
+# 字典表的最小 CRUD，告别手写 SQL。表/列名全部来自此内部配置（非用户输入），
+# 值一律参数化。模具/借用状态等被业务状态机引用（'闲置'/'已借出' 等名称
+# 硬编码在流程中），不开放维护以免破坏流程。
+
+_MASTER_TABLES = {
+    "存放位置": {
+        "table": "storage_locations", "id_col": "location_id", "name_col": "location_name",
+        "has_is_repair": False,
+        "refs": [("molds", "current_location_id", "模具")],
+    },
+    "部件类别": {
+        "table": "mold_part_categories", "id_col": "category_id", "name_col": "category_name",
+        "has_is_repair": False,
+        "refs": [("mold_parts", "part_category_id", "部件")],
+    },
+    "维修类型": {
+        "table": "maintenance_types", "id_col": "type_id", "name_col": "type_name",
+        "has_is_repair": True,
+        "refs": [("mold_maintenance_logs", "maintenance_type_id", "维修记录")],
+    },
+    "模具功能类型": {
+        "table": "mold_functional_types", "id_col": "type_id", "name_col": "type_name",
+        "has_is_repair": False,
+        "refs": [("molds", "mold_functional_type_id", "模具")],
+    },
+}
+
+
+def _master_list(cfg):
+    cols = f"{cfg['id_col']} AS id, {cfg['name_col']} AS name, description"
+    if cfg["has_is_repair"]:
+        cols += ", is_repair"
+    return execute_query(
+        f"SELECT {cols} FROM {cfg['table']} ORDER BY {cfg['name_col']}",
+        fetch_all=True) or []
+
+
+def _master_insert(cfg, name, description=None, is_repair=None):
+    name = (name or '').strip()
+    if not name:
+        return False, "名称不能为空"
+    columns = [cfg["name_col"], "description"]
+    values = [name, (description or '').strip() or None]
+    if cfg["has_is_repair"]:
+        columns.append("is_repair")
+        values.append(1 if is_repair else 0)
+    placeholders = ", ".join(["%s"] * len(columns))
+    try:
+        execute_query(
+            f"INSERT INTO {cfg['table']} ({', '.join(columns)}) VALUES ({placeholders})",
+            params=tuple(values), commit=True)
+        return True, f"已新增「{name}」"
+    except sqlite3.IntegrityError:
+        return False, f"「{name}」已存在"
+    except sqlite3.Error as e:
+        return False, f"新增失败: {e}"
+
+
+def _master_update(cfg, row_id, name, description=None, is_repair=None):
+    name = (name or '').strip()
+    if not name:
+        return False, "名称不能为空"
+    sets = [f"{cfg['name_col']} = %s", "description = %s"]
+    values = [name, (description or '').strip() or None]
+    if cfg["has_is_repair"]:
+        sets.append("is_repair = %s")
+        values.append(1 if is_repair else 0)
+    values.append(row_id)
+    try:
+        rowcount = execute_query(
+            f"UPDATE {cfg['table']} SET {', '.join(sets)} WHERE {cfg['id_col']} = %s",
+            params=tuple(values), commit=True)
+        if rowcount and rowcount > 0:
+            return True, f"已更新「{name}」"
+        return False, "记录不存在"
+    except sqlite3.IntegrityError:
+        return False, f"「{name}」与现有名称重复"
+    except sqlite3.Error as e:
+        return False, f"更新失败: {e}"
+
+
+def _master_ref_count(cfg, row_id):
+    """统计字典项被业务数据引用的条数（删除前检查）。"""
+    total = 0
+    for ref_table, ref_col, _label in cfg["refs"]:
+        row = execute_query(
+            f"SELECT COUNT(*) AS n FROM {ref_table} WHERE {ref_col} = %s",
+            params=(row_id,), fetch_one=True)
+        total += (row['n'] if row else 0)
+    return total
+
+
+def _master_delete(cfg, row_id):
+    refs = _master_ref_count(cfg, row_id)
+    if refs > 0:
+        labels = "/".join(label for _, _, label in cfg["refs"])
+        return False, f"该项已被 {refs} 条业务数据（{labels}）引用，不能删除。如不再使用，建议改名标注「停用」。"
+    try:
+        rowcount = execute_query(
+            f"DELETE FROM {cfg['table']} WHERE {cfg['id_col']} = %s",
+            params=(row_id,), commit=True)
+        if rowcount and rowcount > 0:
+            return True, "已删除"
+        return False, "记录不存在"
+    except sqlite3.Error as e:
+        return False, f"删除失败: {e}"
+
+
+def show_master_data():
+    """主数据（字典表）维护"""
+    st.markdown("## 📚 主数据维护")
+    st.caption("维护存放位置、部件类别、维修类型等字典数据。"
+               "模具/借用状态由业务流程使用，不在此维护。改动后各页面下拉将在缓存刷新后生效。")
+
+    choice = st.selectbox("选择字典表", list(_MASTER_TABLES.keys()), key="master_table_select")
+    cfg = _MASTER_TABLES[choice]
+
+    try:
+        rows = _master_list(cfg)
+    except sqlite3.Error as e:
+        st.error(f"❌ 数据加载失败：{e}")
+        return
+
+    if rows:
+        df = pd.DataFrame(rows)
+        rename = {"id": "ID", "name": "名称", "description": "说明"}
+        if cfg["has_is_repair"]:
+            df["is_repair"] = df["is_repair"].map({1: "维修", 0: "保养"})
+            rename["is_repair"] = "类别"
+        st.dataframe(df.rename(columns=rename), hide_index=True, use_container_width=True)
+        st.caption(f"共 {len(rows)} 项")
+    else:
+        st.info(f"暂无{choice}数据，请在下方新增。")
+
+    name_by_id = {r['id']: r['name'] for r in rows}
+
+    # ── 新增 ──
+    with st.expander(f"➕ 新增{choice}", expanded=not rows):
+        with st.form(f"master_add_{cfg['table']}", clear_on_submit=True):
+            new_name = st.text_input("名称 *")
+            new_desc = st.text_input("说明")
+            new_is_repair = (st.checkbox("属于维修（不勾选=保养）", value=True)
+                             if cfg["has_is_repair"] else None)
+            if st.form_submit_button("新增", type="primary"):
+                ok, msg = _master_insert(cfg, new_name, new_desc, new_is_repair)
+                if ok:
+                    log_user_action('MASTER_DATA_ADD', cfg['table'], new_name.strip())
+                    st.success(f"✅ {msg}")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(f"❌ {msg}")
+
+    if not rows:
+        return
+
+    # ── 编辑 ──
+    with st.expander(f"✏️ 编辑{choice}"):
+        edit_id = st.selectbox(
+            "选择要编辑的项", list(name_by_id.keys()),
+            format_func=lambda i: name_by_id[i], key=f"master_edit_{cfg['table']}")
+        current = next(r for r in rows if r['id'] == edit_id)
+        with st.form(f"master_edit_form_{cfg['table']}"):
+            edit_name = st.text_input("名称 *", value=current['name'])
+            edit_desc = st.text_input("说明", value=current.get('description') or '')
+            edit_is_repair = (st.checkbox("属于维修（不勾选=保养）",
+                                          value=bool(current.get('is_repair')))
+                              if cfg["has_is_repair"] else None)
+            if st.form_submit_button("保存修改", type="primary"):
+                ok, msg = _master_update(cfg, edit_id, edit_name, edit_desc, edit_is_repair)
+                if ok:
+                    log_user_action('MASTER_DATA_UPDATE', cfg['table'], f"{edit_id}:{edit_name.strip()}")
+                    st.success(f"✅ {msg}")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(f"❌ {msg}")
+
+    # ── 删除 ──
+    with st.expander(f"🗑️ 删除{choice}"):
+        del_id = st.selectbox(
+            "选择要删除的项", list(name_by_id.keys()),
+            format_func=lambda i: name_by_id[i], key=f"master_del_{cfg['table']}")
+        st.caption("已被业务数据引用的项不能删除（保护历史记录），建议改名标注「停用」。")
+        if st.button("确认删除", type="primary", key=f"master_del_btn_{cfg['table']}"):
+            ok, msg = _master_delete(cfg, del_id)
+            if ok:
+                log_user_action('MASTER_DATA_DELETE', cfg['table'], str(del_id))
+                st.success(f"✅ {msg}")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(f"❌ {msg}")
+
 
 # ===================== 系统配置部分 =====================
 
