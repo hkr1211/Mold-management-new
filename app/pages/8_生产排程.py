@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import sqlite3
 from datetime import datetime, timedelta, time
-from utils.database import execute_query
+from utils.database import execute_query, add_mold_strokes
 from utils.auth import require_permission
 from utils.ui import inject_global_css, page_header
 from utils.nav import setup_sidebar
@@ -16,6 +16,7 @@ def _build_schedule_data_query():
     return """
     SELECT
         ps.schedule_id,
+        ps.mold_id,
         ps.scheduled_start,
         ps.scheduled_end,
         ps.actual_start,
@@ -316,8 +317,69 @@ def show_schedule_overview():
                 hide_index=True,
                 use_container_width=True
             )
+
+        # 完工登记：任务标记完成 + 实际模次累计入模具台账
+        _show_completion_registration(schedules)
     else:
         st.info("选定时间范围内暂无排程")
+
+
+def _show_completion_registration(schedules):
+    """完工登记：选择未完成任务，填写实际模次，标记完成并累计入模具台账。"""
+    pending = [s for s in schedules if s.get('status') != '已完成']
+    if not pending:
+        return
+
+    st.markdown("### ✅ 完工登记")
+    options = {
+        f"#{s['schedule_id']} {s.get('order_code', '')} · {s.get('mold_code', '')} · "
+        f"计划 {s.get('quantity') or 0} 件（{s.get('status', '')}）": s
+        for s in pending
+    }
+    with st.form("schedule_completion_form"):
+        selected_label = st.selectbox("选择要登记完工的任务", list(options.keys()))
+        actual_strokes = st.number_input(
+            "实际模次 *", min_value=0,
+            value=int(options[selected_label].get('quantity') or 0), step=100,
+            help="该任务实际冲压的模次，将累计入模具台账。一模多腔请按冲次（非件数）填写。"
+        )
+        submitted = st.form_submit_button("✅ 标记完成并累计模次", type="primary")
+
+    if submitted:
+        task = options[selected_label]
+        if actual_strokes <= 0:
+            st.error("❌ 实际模次必须大于 0；若任务作废请联系管理员处理")
+            return
+        try:
+            execute_query(
+                """
+                UPDATE production_schedules
+                SET status = '已完成',
+                    actual_start = COALESCE(actual_start, scheduled_start),
+                    actual_end = %s,
+                    updated_at = %s
+                WHERE schedule_id = %s AND status != '已完成'
+                """,
+                params=(datetime.now(), datetime.now(), task['schedule_id']),
+                commit=True
+            )
+        except sqlite3.Error as e:
+            st.error(f"❌ 完工登记失败：{e}")
+            return
+
+        ok, msg = add_mold_strokes(
+            task['mold_id'], actual_strokes, 'schedule_complete',
+            source_id=task['schedule_id'],
+            operator_id=st.session_state.get('user_id'),
+            remarks=f"排程 #{task['schedule_id']} 完工（订单 {task.get('order_code', '')}）"
+        )
+        if ok:
+            from utils.auth import log_user_action
+            log_user_action('COMPLETE_SCHEDULE', 'production_schedules', str(task['schedule_id']))
+            st.success(f"✅ 任务 #{task['schedule_id']} 已完成，模具 {task.get('mold_code', '')} 累计 +{actual_strokes:,} 模次")
+            st.rerun()
+        else:
+            st.error(f"⚠️ 任务已标记完成，但模次累计失败：{msg}。请在模具管理中手动调整。")
 
 def show_create_schedule():
     """创建排程"""

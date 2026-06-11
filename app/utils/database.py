@@ -319,6 +319,53 @@ def get_storage_locations() -> List[Dict]:
         logger.error(f"获取存储位置失败: {e}")
         return []
 
+def add_mold_strokes(mold_id: int, strokes: int, source_type: str,
+                     source_id=None, operator_id: Optional[int] = None,
+                     remarks: Optional[str] = None):
+    """模次累计的唯一业务入口：同一事务内累加台账并写入流水。
+
+    source_type: 'loan_return' / 'schedule_complete' / 'manual_adjust'。
+    strokes 一般为正；manual_adjust 允许负数（纠错回调）。
+    返回 (bool, msg)。
+    """
+    try:
+        strokes = int(strokes)
+    except (TypeError, ValueError):
+        return False, "模次必须是整数"
+    if strokes == 0:
+        return False, "模次增量不能为 0"
+
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE molds SET accumulated_strokes = COALESCE(accumulated_strokes, 0) + ?, "
+            "updated_at = datetime('now') WHERE mold_id = ?",
+            (strokes, mold_id),
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            return False, f"模具不存在: {mold_id}"
+        cur.execute(
+            "INSERT INTO mold_stroke_logs "
+            "(mold_id, strokes_added, source_type, source_id, operator_id, remarks) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (mold_id, strokes,
+             source_type,
+             str(source_id) if source_id is not None else None,
+             operator_id, remarks),
+        )
+        conn.commit()
+        logger.info(f"模次累计: mold_id={mold_id}, +{strokes}, source={source_type}/{source_id}")
+        return True, "模次已累计"
+    except sqlite3.Error as e:
+        conn.rollback()
+        logger.error(f"模次累计失败: mold_id={mold_id}, {e}")
+        return False, f"模次累计失败: {e}"
+    except Exception:
+        conn.rollback()  # 编码缺陷也先回滚事务，再上抛暴露
+        raise
+
 def get_functional_types() -> List[Dict]:
     try:
         return execute_query(
@@ -337,6 +384,7 @@ _ALLOWED_TABLES = {
     'maintenance_types', 'mold_functional_types', 'storage_locations',
     'production_equipment', 'production_orders', 'production_schedules',
     'mold_recommendations', 'cost_records', 'products',
+    'login_attempts', 'mold_stroke_logs',
 }
 
 _IDENTIFIER_RE = _re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')

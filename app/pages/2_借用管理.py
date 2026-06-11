@@ -6,10 +6,11 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, date
 from utils.database import (
-    execute_query, 
+    execute_query,
     get_db_connection,
-    get_loan_statuses, 
-    convert_numpy_types 
+    get_loan_statuses,
+    convert_numpy_types,
+    add_mold_strokes
 )
 
 # Configure logging
@@ -577,8 +578,24 @@ def view_loan_applications():
                                 st.rerun()
                     
                     elif record['loan_status'] == '已借出' and can_manage_loan_flow:
+                        used_strokes = st.number_input(
+                            "本次使用模次 *", min_value=0, value=0, step=100,
+                            key=f"strokes_{app_id}",
+                            help="本次借用期间该模具实际冲压的模次，归还时累计入台账"
+                        )
+                        if used_strokes == 0:
+                            st.caption("⚠️ 填 0 表示本次未使用（如借出检查），不累计模次")
                         if st.button("📥 标记归还", key=f"return_{app_id}", help="标记模具已归还"):
                             if mark_as_returned(app_id, mold_id, current_user_id):
+                                if used_strokes > 0:
+                                    ok, msg = add_mold_strokes(
+                                        mold_id, used_strokes, 'loan_return',
+                                        source_id=app_id, operator_id=current_user_id,
+                                        remarks=f"借用单 {app_id} 归还"
+                                    )
+                                    if not ok:
+                                        st.error(f"⚠️ 归还成功，但模次累计失败：{msg}。"
+                                                 f"请在模具管理中手动调整。")
                                 st.rerun()
 
     except sqlite3.Error as e:

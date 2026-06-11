@@ -173,6 +173,20 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     locked_until TEXT
 );
 
+-- ── 模次累计流水（molds.accumulated_strokes 的唯一审计来源）──────────
+-- source_type: loan_return（借用归还）/ schedule_complete（排程完工）/ manual_adjust（台账手动调整）
+CREATE TABLE IF NOT EXISTS mold_stroke_logs (
+    stroke_log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mold_id       INTEGER NOT NULL REFERENCES molds(mold_id),
+    strokes_added INTEGER NOT NULL,
+    source_type   TEXT    NOT NULL,
+    source_id     TEXT,
+    operator_id   INTEGER REFERENCES users(user_id),
+    remarks       TEXT,
+    created_at    TEXT    DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_stroke_logs_mold ON mold_stroke_logs(mold_id);
+
 -- ── 生产设备 ──────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS production_equipment (
     equipment_id   INTEGER PRIMARY KEY AUTOINCREMENT,

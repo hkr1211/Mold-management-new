@@ -329,6 +329,19 @@ with tab3:
                                 resp_id, new_remarks.strip() or None,
                                 code_to_edit
                             ), commit=True)
+                            # 手动改动累计模次 → 记入模次流水（manual_adjust），保证台账可审计
+                            old_accumulated = int(mold_row.get('accumulated_strokes') or 0)
+                            delta = int(new_accumulated) - old_accumulated
+                            if delta != 0:
+                                execute_query(
+                                    "INSERT INTO mold_stroke_logs "
+                                    "(mold_id, strokes_added, source_type, source_id, operator_id, remarks) "
+                                    "VALUES (%s, %s, 'manual_adjust', %s, %s, %s)",
+                                    params=(mold_row['mold_id'], delta, code_to_edit,
+                                            st.session_state.get('user_id'),
+                                            f"台账编辑：{old_accumulated} → {new_accumulated}"),
+                                    commit=True
+                                )
                             log_user_action('UPDATE_MOLD', 'molds', code_to_edit)
                             st.success(f"✅ 模具 {code_to_edit} 更新成功！")
                             st.cache_data.clear()

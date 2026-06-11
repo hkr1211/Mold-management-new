@@ -172,10 +172,15 @@ def get_maintenance_result_statuses():
         st.error(f"获取维修结果状态失败: {e}")
         return []
 
-def get_molds_needing_maintenance():
-    """获取需要维修/保养的模具"""
-    query = """
-    SELECT 
+def _build_molds_needing_maintenance_query():
+    """保养预警查询。
+
+    判定依据是"距上次保养的模次"（累计模次 − 最近一次已完成保养记录的
+    strokes_at_maintenance），而非累计模次本身 —— 否则模具过了第一个保养
+    周期后会永久报警，保养完成也不消警。
+    """
+    return """
+    SELECT
         m.mold_id,
         m.mold_code,
         m.mold_name,
@@ -185,38 +190,47 @@ def get_molds_needing_maintenance():
         mft.type_name as functional_type,
         ms.status_name as current_status,
         sl.location_name as current_location,
-        CASE 
-            WHEN m.maintenance_cycle_strokes > 0 AND m.accumulated_strokes >= m.maintenance_cycle_strokes 
-            THEN '需要保养'
+        CASE
             WHEN m.current_status_id IN (SELECT status_id FROM mold_statuses WHERE status_name IN ('待维修', '待保养'))
             THEN '等待维修/保养'
+            WHEN m.maintenance_cycle_strokes > 0
+                 AND (m.accumulated_strokes - COALESCE(lm.last_maint_strokes, 0)) >= m.maintenance_cycle_strokes
+            THEN '需要保养'
             WHEN m.theoretical_lifespan_strokes > 0 AND m.accumulated_strokes >= m.theoretical_lifespan_strokes * 0.9
             THEN '即将到期'
             ELSE '正常'
         END as maintenance_status,
-        CASE 
-            WHEN m.maintenance_cycle_strokes > 0 
-            THEN m.accumulated_strokes - (m.accumulated_strokes / m.maintenance_cycle_strokes) * m.maintenance_cycle_strokes
-            ELSE 0
-        END as strokes_since_maintenance
+        (m.accumulated_strokes - COALESCE(lm.last_maint_strokes, 0)) as strokes_since_maintenance
     FROM molds m
     LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
     LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
     LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
-    WHERE 
-        (m.maintenance_cycle_strokes > 0 AND m.accumulated_strokes >= m.maintenance_cycle_strokes)
+    LEFT JOIN (
+        SELECT mold_id, MAX(COALESCE(strokes_at_maintenance, 0)) AS last_maint_strokes
+        FROM mold_maintenance_logs
+        WHERE maintenance_end_timestamp IS NOT NULL
+        GROUP BY mold_id
+    ) lm ON lm.mold_id = m.mold_id
+    WHERE
+        (m.maintenance_cycle_strokes > 0
+         AND (m.accumulated_strokes - COALESCE(lm.last_maint_strokes, 0)) >= m.maintenance_cycle_strokes)
         OR m.current_status_id IN (SELECT status_id FROM mold_statuses WHERE status_name IN ('待维修', '待保养'))
         OR (m.theoretical_lifespan_strokes > 0 AND m.accumulated_strokes >= m.theoretical_lifespan_strokes * 0.9)
-    ORDER BY 
-        CASE 
+    ORDER BY
+        CASE
             WHEN ms.status_name IN ('待维修', '待保养') THEN 1
-            WHEN m.maintenance_cycle_strokes > 0 AND m.accumulated_strokes >= m.maintenance_cycle_strokes THEN 2
+            WHEN m.maintenance_cycle_strokes > 0
+                 AND (m.accumulated_strokes - COALESCE(lm.last_maint_strokes, 0)) >= m.maintenance_cycle_strokes THEN 2
             ELSE 3
         END,
         m.mold_code
     """
+
+
+def get_molds_needing_maintenance():
+    """获取需要维修/保养的模具"""
     try:
-        return execute_query(query, fetch_all=True) or []
+        return execute_query(_build_molds_needing_maintenance_query(), fetch_all=True) or []
     except sqlite3.Error as e:
         st.error(f"获取维修需求失败: {e}")
         return []
@@ -249,15 +263,17 @@ def search_molds_for_maintenance(search_term=""):
         m.accumulated_strokes,
         m.maintenance_cycle_strokes,
         m.theoretical_lifespan_strokes,
-        CASE 
-            WHEN m.maintenance_cycle_strokes > 0 
-            THEN m.accumulated_strokes - (m.accumulated_strokes / m.maintenance_cycle_strokes) * m.maintenance_cycle_strokes
-            ELSE m.accumulated_strokes
-        END as strokes_since_maintenance
+        (m.accumulated_strokes - COALESCE(lm.last_maint_strokes, 0)) as strokes_since_maintenance
     FROM molds m
     LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
     LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
     LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+    LEFT JOIN (
+        SELECT mold_id, MAX(COALESCE(strokes_at_maintenance, 0)) AS last_maint_strokes
+        FROM mold_maintenance_logs
+        WHERE maintenance_end_timestamp IS NOT NULL
+        GROUP BY mold_id
+    ) lm ON lm.mold_id = m.mold_id
     """
     
     params = []
@@ -614,13 +630,21 @@ def save_maintenance_record(mold_id, maintenance_type_id, maintained_by_id, star
                         st.info("或者联系管理员执行数据库初始化脚本")
                         return False
             
+            # 记录维修发生时的累计模次（保养预警以此计算"距上次保养模次"）
+            cursor.execute(
+                "SELECT COALESCE(accumulated_strokes, 0) FROM molds WHERE mold_id = %s",
+                (mold_id,)
+            )
+            strokes_row = cursor.fetchone()
+            strokes_at_maintenance = strokes_row[0] if strokes_row else 0
+
             # 插入维修记录
             insert_query = """
             INSERT INTO mold_maintenance_logs (
                 mold_id, maintenance_type_id, technician_id,
                 maintenance_start_timestamp, maintenance_end_timestamp,
-                description, cost, result_status_id, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                description, cost, result_status_id, strokes_at_maintenance, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING log_id
             """
             combined_description = _build_maintenance_description(
@@ -628,12 +652,12 @@ def save_maintenance_record(mold_id, maintenance_type_id, maintained_by_id, star
                 actions_taken=actions_taken,
                 notes=notes,
             )
-            
+
             cursor.execute(insert_query, (
                 mold_id, maintenance_type_id, maintained_by_id,
                 start_timestamp, end_timestamp,
                 combined_description, maintenance_cost,
-                result_status_id, datetime.now()
+                result_status_id, strokes_at_maintenance, datetime.now()
             ))
             
             log_id = cursor.fetchone()[0]
