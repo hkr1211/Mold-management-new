@@ -3,6 +3,7 @@
 import streamlit as st
 import bcrypt
 import functools
+import secrets
 import sqlite3
 from utils.database import execute_query, check_table_exists
 import logging
@@ -12,10 +13,12 @@ from datetime import datetime, timedelta
 
 try:
     from config.settings import (
-        LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_SECONDS, PASSWORD_MIN_LENGTH
+        LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_SECONDS, PASSWORD_MIN_LENGTH,
+        SESSION_TTL_DAYS
     )
 except ImportError:
     LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_SECONDS, PASSWORD_MIN_LENGTH = 5, 300, 8
+    SESSION_TTL_DAYS = 7
 
 # 日志：库模块只取 logger，全局配置交给入口 main.py
 logger = logging.getLogger(__name__)
@@ -167,6 +170,89 @@ def _reset_attempts(username: str) -> None:
     except sqlite3.Error as e:
         logger.error(f"清除登录失败计数失败: {e}")
 
+# ── 登录会话持久化（服务端令牌 + URL 参数，刷新页面不掉线）──────────
+# 令牌经 URL 参数 sid 携带：对局域网内部工具是务实折中——退出即吊销、
+# 到期自动失效、每次登录轮换新令牌。
+
+def create_session(user_id: int):
+    """创建服务端会话令牌；顺带清理过期令牌。失败返回 None（仅影响持久化，不影响登录）。"""
+    token = secrets.token_urlsafe(32)
+    try:
+        execute_query(
+            "DELETE FROM user_sessions WHERE expires_at <= datetime('now')",
+            commit=True)
+        execute_query(
+            "INSERT INTO user_sessions (session_token, user_id, expires_at) "
+            "VALUES (%s, %s, datetime('now', %s))",
+            params=(token, user_id, f'+{int(SESSION_TTL_DAYS)} days'), commit=True)
+        return token
+    except sqlite3.Error as e:
+        logger.error(f"创建登录会话失败: {e}")
+        return None
+
+
+def validate_session_token(token: str):
+    """校验令牌：有效且用户在职则返回用户信息，否则 None。"""
+    if not token:
+        return None
+    try:
+        return execute_query(
+            """
+            SELECT s.user_id, u.username, u.full_name, r.role_name
+            FROM user_sessions s
+            JOIN users u ON s.user_id = u.user_id
+            LEFT JOIN roles r ON u.role_id = r.role_id
+            WHERE s.session_token = %s
+              AND u.is_active = true
+              AND s.expires_at > datetime('now')
+            """,
+            params=(token,), fetch_one=True)
+    except sqlite3.Error as e:
+        logger.error(f"校验登录会话失败: {e}")
+        return None
+
+
+def delete_session(token: str) -> None:
+    """吊销令牌（登出时调用）。"""
+    if not token:
+        return
+    try:
+        execute_query(
+            "DELETE FROM user_sessions WHERE session_token = %s",
+            params=(token,), commit=True)
+    except sqlite3.Error as e:
+        logger.error(f"吊销登录会话失败: {e}")
+
+
+def restore_session() -> bool:
+    """页面入口调用：未登录时尝试从 URL 令牌恢复登录态。返回当前是否已登录。"""
+    if st.session_state.get('logged_in'):
+        return True
+    qp = getattr(st, 'query_params', None)
+    if qp is None:
+        return False
+    token = qp.get('sid')
+    if not token:
+        return False
+    info = validate_session_token(token)
+    if not info:
+        # 失效令牌从 URL 清掉，避免反复校验
+        try:
+            del qp['sid']
+        except KeyError:
+            pass
+        return False
+    if not info.get('role_name'):
+        return False
+    st.session_state['logged_in'] = True
+    st.session_state['user_id'] = info['user_id']
+    st.session_state['username'] = info['username']
+    st.session_state['full_name'] = info.get('full_name') or info['username']
+    st.session_state['user_role'] = info['role_name']
+    st.session_state['session_token'] = token
+    return True
+
+
 def login_user(username: str, password: str):
     """用户登录 - 服务端失败计数与锁定（基于 DB，清除会话无法绕过）"""
     # 服务端锁定检查
@@ -187,6 +273,14 @@ def login_user(username: str, password: str):
         st.session_state['full_name'] = user_info.get('full_name', user_info['username'])
         st.session_state['user_role'] = user_info['role']
 
+        # 持久化会话令牌（刷新页面不掉线）；失败不影响本次登录
+        token = create_session(user_info['user_id'])
+        if token:
+            st.session_state['session_token'] = token
+            qp = getattr(st, 'query_params', None)
+            if qp is not None:
+                qp['sid'] = token
+
         # 记录日志
         try:
             log_user_action('LOGIN', 'system', username)
@@ -200,15 +294,24 @@ def login_user(username: str, password: str):
         return None
 
 def logout_user():
-    """用户登出"""
+    """用户登出：吊销持久化令牌并清除会话。"""
     username = st.session_state.get('username', '')
-    
+
     # 记录日志
     if username:
         try:
             log_user_action('LOGOUT', 'system', username)
         except Exception as e:
             logger.error(f"记录登出日志失败: {e}")
+
+    # 吊销服务端令牌 + 清除 URL 参数
+    delete_session(st.session_state.get('session_token'))
+    qp = getattr(st, 'query_params', None)
+    if qp is not None:
+        try:
+            del qp['sid']
+        except KeyError:
+            pass
 
     # 清除会话
     for key in list(st.session_state.keys()):
@@ -447,6 +550,7 @@ def require_permission(permission: str):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            restore_session()  # 刷新页面后先尝试从令牌恢复登录态
             if not st.session_state.get('logged_in', False):
                 st.error("🔒 请先登录以访问此页面。")
                 st.stop()

@@ -1348,8 +1348,10 @@ def show():
     """主函数 - 显示维修保养管理页面"""
     from utils.ui import inject_global_css, page_header
     from utils.nav import setup_sidebar
+    from utils.auth import restore_session
     inject_global_css()
 
+    restore_session()  # 刷新页面后从令牌恢复登录态
     if not st.session_state.get('logged_in'):
         st.error("🔒 请先登录以访问此页面。")
         st.stop()

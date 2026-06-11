@@ -21,3 +21,4 @@ LOOKUP_CACHE_TTL = 600       # 字典表（状态/位置等）缓存 TTL
 LOGIN_MAX_ATTEMPTS = 5       # 最大失败登录次数
 LOGIN_LOCKOUT_SECONDS = 300  # 锁定时长（秒）
 PASSWORD_MIN_LENGTH = 8      # 密码最小长度
+SESSION_TTL_DAYS = 7         # 登录会话有效期（天），到期需重新登录

@@ -389,7 +389,7 @@ _ALLOWED_TABLES = {
     'maintenance_types', 'mold_functional_types', 'storage_locations',
     'production_equipment', 'production_orders', 'production_schedules',
     'mold_recommendations', 'cost_records', 'products',
-    'login_attempts', 'mold_stroke_logs',
+    'login_attempts', 'mold_stroke_logs', 'user_sessions',
 }
 
 _IDENTIFIER_RE = _re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')

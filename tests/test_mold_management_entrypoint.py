@@ -73,6 +73,7 @@ def _load_page(st_mock, has_permission=None):
     sys.modules["utils.database"] = database
 
     auth = types.ModuleType("utils.auth")
+    auth.restore_session = lambda *a, **kw: False
     auth.has_permission = has_permission or (lambda *a, **kw: True)
     auth.log_user_action = lambda *a, **kw: None
     sys.modules["utils.auth"] = auth

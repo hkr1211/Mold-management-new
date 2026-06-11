@@ -1,6 +1,6 @@
 # app/main.py
 import streamlit as st
-from utils.auth import login_user, logout_user
+from utils.auth import login_user, logout_user, restore_session
 from utils.database import execute_query, ensure_database_initialized, test_connection
 from utils.ui import inject_global_css, page_header, stat_card, activity_row, PURPLE, SUCCESS, WARNING, DANGER
 from utils.nav import NAV, nav_buttons, setup_sidebar
@@ -357,6 +357,7 @@ def main():
         st.stop()
 
     _init_session()
+    restore_session()  # 刷新页面后从 URL 令牌恢复登录态
 
     if not st.session_state.get('logged_in'):
         show_login_page()
