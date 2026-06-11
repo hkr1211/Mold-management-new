@@ -58,6 +58,7 @@ def _load_schedule_module():
 
     database = types.ModuleType("utils.database")
     database.execute_query = lambda *a, **kw: []
+    database.add_mold_strokes = lambda *a, **kw: (True, "ok")
     sys.modules["utils.database"] = database
 
     auth = types.ModuleType("utils.auth")
