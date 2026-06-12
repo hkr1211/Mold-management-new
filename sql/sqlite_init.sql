@@ -348,6 +348,7 @@ ON CONFLICT(location_name) DO UPDATE SET description = excluded.description;
 INSERT INTO mold_part_categories (category_name, description) VALUES
     ('凸模',   '冲头类零件'),
     ('凹模',   '凹模类零件'),
+    ('压边圈', '拉延模压边圈部件'),
     ('导柱导套','导向零件'),
     ('弹簧',   '弹性元件'),
     ('螺钉销钉','紧固件'),

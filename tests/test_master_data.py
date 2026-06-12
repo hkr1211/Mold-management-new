@@ -188,3 +188,16 @@ def test_all_master_tables_configs_valid():
         m._master_list(cfg)  # 不抛异常
         ok, msg = m._master_insert(cfg, f"测试-{label}")
         assert ok, f"{label}: {msg}"
+
+
+def test_seed_part_categories_include_pressure_ring():
+    """种子数据回归：部件类别必须含「压边圈」（验收时发现缺失，2026-06-12 补）。
+
+    压边圈管理已并入部件列表、靠类别筛选承载，种子缺该类别会导致
+    压边圈既无法录入也无法筛选。
+    """
+    conn = sqlite3.connect(":memory:")
+    with open(_INIT_SQL, encoding="utf-8") as f:
+        conn.executescript(f.read())
+    cats = {r[0] for r in conn.execute("SELECT category_name FROM mold_part_categories")}
+    assert "压边圈" in cats, f"种子类别缺压边圈，现有: {sorted(cats)}"
