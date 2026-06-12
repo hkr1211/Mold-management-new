@@ -276,6 +276,35 @@ class TestAddMoldStrokes:
             "SELECT COUNT(*) AS n FROM mold_stroke_logs", fetch_one=True)['n']
         assert after == before  # 事务回滚，不留孤儿流水
 
+    def test_legacy_supplier_migrated_to_maker(self):
+        """旧库迁移：supplier 列重命名为 maker（数据保留）、补 specification 列、幂等。"""
+        import sqlite3 as _sq
+        conn = _sq.connect(':memory:')
+        conn.execute("CREATE TABLE molds (mold_id INTEGER PRIMARY KEY, "
+                     "mold_code TEXT, supplier TEXT)")
+        conn.execute("INSERT INTO molds (mold_id, mold_code, supplier) "
+                     "VALUES (1, 'M1', '老供应商')")
+
+        _db_module._migrate_legacy_schema(conn)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(molds)")}
+        assert 'maker' in cols and 'supplier' not in cols
+        assert 'specification' in cols
+        # 旧数据迁入新列
+        assert conn.execute("SELECT maker FROM molds WHERE mold_id=1").fetchone()[0] == '老供应商'
+
+        _db_module._migrate_legacy_schema(conn)  # 重复执行幂等不报错
+
+    def test_fresh_schema_has_maker_and_specification(self):
+        """新库由 init 脚本直接建出目标结构（maker/specification，无 supplier）。"""
+        import sqlite3 as _sq
+        conn = _sq.connect(':memory:')
+        init_path = os.path.join(os.path.dirname(__file__), '..', 'sql', 'sqlite_init.sql')
+        with open(init_path, encoding='utf-8') as f:
+            conn.executescript(f.read())
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(molds)")}
+        assert 'maker' in cols and 'specification' in cols
+        assert 'supplier' not in cols
+
     def test_negative_manual_adjust_allowed(self):
         row = _db_module.execute_query(
             "SELECT accumulated_strokes FROM molds WHERE mold_id = 901", fetch_one=True)

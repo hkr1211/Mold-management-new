@@ -44,18 +44,19 @@ page_header("🛠️", "模具管理", "模具台账 · 新增 · 编辑")
 
 # --- 数据加载 ---
 @st.cache_data(ttl=300)
-def load_molds(search_code="", search_name="", status_filter="全部", page=1, page_size=100):
+def load_molds(keyword="", status_filter="全部", page=1, page_size=100):
     # 不再吞异常：DB 故障与编码缺陷一律上抛，由调用方（_load_or_stop）区分
     # 展示“加载失败”与“暂无数据”。
+    # 统一模糊关键词：编号 / 名称 / 制作人 / 规格 任一命中即返回。
     where_clauses = []
     params = []
 
-    if search_code:
-        where_clauses.append("m.mold_code LIKE %s")
-        params.append(f"%{search_code}%")
-    if search_name:
-        where_clauses.append("m.mold_name LIKE %s")
-        params.append(f"%{search_name}%")
+    if keyword:
+        where_clauses.append(
+            "(m.mold_code LIKE %s OR m.mold_name LIKE %s "
+            "OR m.maker LIKE %s OR m.specification LIKE %s)")
+        kw = f"%{keyword}%"
+        params.extend([kw, kw, kw, kw])
     if status_filter != "全部":
         where_clauses.append("ms.status_name = %s")
         params.append(status_filter)
@@ -74,7 +75,8 @@ def load_molds(search_code="", search_name="", status_filter="全部", page=1, p
         m.theoretical_lifespan_strokes AS 理论寿命,
         m.maintenance_cycle_strokes    AS 保养周期,
         u.full_name        AS 负责人,
-        m.supplier         AS 供应商,
+        m.maker            AS 制作人,
+        m.specification    AS 模具规格,
         m.remarks          AS 备注,
         m.created_at       AS 创建时间
     FROM molds m
@@ -218,27 +220,26 @@ tab1, tab2, tab3, tab4 = st.tabs(["📋 模具列表", "➕ 新增模具", "✏�
 
 # ========== TAB1：模具列表 ==========
 with tab1:
-    col1, col2, col3 = st.columns([2, 2, 2])
+    col1, col2, col3 = st.columns([4, 2, 1])
     with col1:
-        search_code = st.text_input("按编号搜索", placeholder="输入模具编号...", key="search_code")
+        keyword = st.text_input(
+            "🔍 关键词搜索", key="mold_keyword",
+            placeholder="模糊匹配：编号 / 名称 / 制作人 / 规格（支持扫码枪）")
     with col2:
-        search_name = st.text_input("按名称搜索", placeholder="输入模具名称...", key="search_name")
-    with col3:
         statuses, _, _, _ = _load_or_stop(load_lookup_data)
         status_names = ["全部"] + [s['status_name'] for s in statuses]
         status_filter = st.selectbox("状态筛选", status_names, key="status_filter")
+    with col3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔍 搜索", type="primary", key="search_list", use_container_width=True):
+            st.cache_data.clear()  # 搜索同时获取最新数据（替代原"刷新"）
+            st.rerun()
 
     page_col, size_col, _ = st.columns([1, 1, 4])
     page = page_col.number_input("页码", min_value=1, value=1, step=1, key="mold_page")
     page_size = size_col.selectbox("每页", [50, 100, 200], index=1, key="mold_page_size")
 
-    col_refresh, col_export = st.columns([1, 7])
-    with col_refresh:
-        if st.button("🔄 刷新", key="refresh_list"):
-            st.cache_data.clear()
-            st.rerun()
-
-    df = _load_or_stop(load_molds, search_code, search_name, status_filter, page, page_size)
+    df = _load_or_stop(load_molds, keyword.strip(), status_filter, page, page_size)
 
     if df.empty:
         st.info("暂无符合条件的模具记录。")
@@ -280,7 +281,8 @@ with tab2:
             mold_code = c1.text_input("模具编号 *", placeholder="例：MD-2024-001")
             mold_name = c2.text_input("模具名称 *", placeholder="例：前门外板拉延模")
             drawing_number = c1.text_input("图号", placeholder="DWG-001")
-            supplier = c2.text_input("供应商")
+            maker = c2.text_input("制作人", placeholder="模具制作人/制作单位")
+            specification = c1.text_input("模具规格", placeholder="具体尺寸，例：1200×800×650mm")
 
             type_options = {t['type_name']: t['type_id'] for t in types}
             functional_type = c1.selectbox(
@@ -334,17 +336,17 @@ with tab2:
 
                     insert_sql = """
                     INSERT INTO molds (
-                        mold_code, mold_name, mold_drawing_number, supplier,
+                        mold_code, mold_name, mold_drawing_number, maker, specification,
                         mold_functional_type_id, manufacturing_date,
                         theoretical_lifespan_strokes, maintenance_cycle_strokes, accumulated_strokes,
                         current_status_id, current_location_id, responsible_person_id,
                         remarks, created_at, updated_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
                     """
                     try:
                         execute_query(insert_sql, params=(
                             mold_code.strip(), mold_name.strip(), drawing_number.strip() or None,
-                            supplier.strip() or None, type_id, mfg_date,
+                            maker.strip() or None, specification.strip() or None, type_id, mfg_date,
                             lifespan, cycle, accumulated,
                             status_id, loc_id, resp_id,
                             remarks.strip() or None
@@ -395,7 +397,10 @@ with tab3:
                     st.subheader(f"编辑：{mold_row['mold_code']} — {mold_row['mold_name']}")
                     c1, c2 = st.columns(2)
                     new_name = c1.text_input("模具名称 *", value=mold_row.get('mold_name', ''))
-                    new_supplier = c2.text_input("供应商", value=mold_row.get('supplier', '') or '')
+                    new_maker = c2.text_input("制作人", value=mold_row.get('maker', '') or '')
+                    new_specification = c1.text_input(
+                        "模具规格", value=mold_row.get('specification', '') or '',
+                        placeholder="具体尺寸，例：1200×800×650mm")
 
                     c3, c4 = st.columns(2)
                     cur_status = mold_row.get('status_name', '')
@@ -438,7 +443,7 @@ with tab3:
                         resp_id = user_options.get(new_responsible) if new_responsible != "（未选择）" else None
                         update_sql = """
                         UPDATE molds SET
-                            mold_name = %s, supplier = %s,
+                            mold_name = %s, maker = %s, specification = %s,
                             current_status_id = %s, current_location_id = %s,
                             theoretical_lifespan_strokes = %s,
                             maintenance_cycle_strokes = %s, accumulated_strokes = %s,
@@ -448,7 +453,8 @@ with tab3:
                         """
                         try:
                             execute_query(update_sql, params=(
-                                new_name.strip(), new_supplier.strip() or None,
+                                new_name.strip(), new_maker.strip() or None,
+                                new_specification.strip() or None,
                                 status_options[new_status], loc_id,
                                 new_lifespan, new_cycle, new_accumulated,
                                 resp_id, new_remarks.strip() or None,
@@ -524,10 +530,11 @@ with tab4:
             i2.markdown(f"**当前状态**：{mold.get('current_status') or '—'}")
             i3.markdown(f"**存放位置**：{mold.get('current_location') or '—'}")
             i4.markdown(f"**负责人**：{mold.get('responsible_person') or '—'}")
-            i1.markdown(f"**供应商**：{mold.get('supplier') or '—'}")
-            i2.markdown(f"**图号**：{mold.get('mold_drawing_number') or '—'}")
-            i3.markdown(f"**制造日期**：{mold.get('manufacturing_date') or '—'}")
-            i4.markdown(f"**备注**：{mold.get('remarks') or '—'}")
+            i1.markdown(f"**制作人**：{mold.get('maker') or '—'}")
+            i2.markdown(f"**模具规格**：{mold.get('specification') or '—'}")
+            i3.markdown(f"**图号**：{mold.get('mold_drawing_number') or '—'}")
+            i4.markdown(f"**制造日期**：{mold.get('manufacturing_date') or '—'}")
+            i1.markdown(f"**备注**：{mold.get('remarks') or '—'}")
 
             # ── 寿命与保养 ──
             st.markdown("#### 📊 寿命与保养")
