@@ -52,3 +52,20 @@ def test_unknown_columns_ignored():
     ui = _load_ui()
     out = ui.build_csv_bytes([{"a": 1}], columns=["a", "missing"]).decode("utf-8-sig")
     assert out.splitlines()[0].strip() == "a"  # 不存在的列被忽略，不报错
+
+
+# ── 二维码标签 ─────────────────────────────────────────────────────
+
+def test_qr_data_uri_for_mold_code():
+    ui = _load_ui()
+    uri = ui.qr_data_uri("MD-001")
+    if uri is None:
+        import pytest
+        pytest.skip("segno 未安装，二维码功能降级（生产环境由 requirements 提供）")
+    assert uri.startswith("data:image/svg+xml")  # 可直接用于 <img src>
+
+
+def test_qr_data_uri_empty_returns_none():
+    ui = _load_ui()
+    assert ui.qr_data_uri("") is None
+    assert ui.qr_data_uri(None) is None

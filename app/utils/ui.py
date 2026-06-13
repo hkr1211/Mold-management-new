@@ -225,6 +225,41 @@ def build_csv_bytes(data, columns=None) -> bytes:
     return df.to_csv(index=False).encode('utf-8-sig')
 
 
+def qr_data_uri(text, scale: int = 5):
+    """生成内容为 text 的二维码 SVG data URI（可直接用于 <img src>）。
+
+    segno 未安装或 text 为空时返回 None，调用方应据此降级。
+    与 Streamlit 解耦，便于单测。
+    """
+    if not text:
+        return None
+    try:
+        import segno
+    except ImportError:
+        return None
+    return segno.make(str(text), error='m').svg_data_uri(scale=scale)
+
+
+def render_qr_label(code: str, title: str = "", *,
+                    caption: str = "打印：浏览器 Ctrl+P；扫码枪扫此码即可在搜索框定位") -> None:
+    """渲染可打印的二维码标签（编码 = 模具编号，扫码枪扫描后可直接搜索定位）。"""
+    uri = qr_data_uri(code)
+    if uri is None:
+        st.info("二维码生成需要 segno 库（已列入 requirements.txt / 离线安装包）。"
+                "未安装时可手抄编号；扫码枪仍可扫描已有实物标签。")
+        return
+    st.markdown(
+        f"""<div style="display:inline-block;text-align:center;border:1px solid #d1d5db;
+                    padding:14px 18px;border-radius:10px;background:#fff;">
+              <img src="{uri}" width="180" height="180" alt="QR {code}"/>
+              <div style="font-weight:700;font-size:1.15rem;margin-top:8px;color:#111827;">{code}</div>
+              <div style="color:#374151;font-size:.9rem;">{title}</div>
+            </div>""",
+        unsafe_allow_html=True,
+    )
+    st.caption(caption)
+
+
 def download_csv_button(data, filename_prefix: str, *, columns=None,
                         label: str = "📥 导出 CSV", key=None) -> None:
     """渲染"导出 CSV"下载按钮；文件名带当日日期。data 为空则按钮禁用。"""

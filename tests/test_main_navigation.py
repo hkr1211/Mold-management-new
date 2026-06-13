@@ -64,6 +64,7 @@ def _load_main_module(clicked_label: str = ""):
     ui.inject_global_css = lambda: None
     ui.page_header = lambda *a, **kw: None
     ui.download_csv_button = lambda *a, **kw: None
+    ui.render_qr_label = lambda *a, **kw: None
     ui.stat_card = lambda *a, **kw: None
     ui.activity_row = lambda *a, **kw: None
     ui.PURPLE = "#7e3af2"

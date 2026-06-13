@@ -10,7 +10,7 @@ from utils.database import (
     get_storage_locations, get_functional_types
 )
 from utils.auth import has_permission, log_user_action, restore_session
-from utils.ui import inject_global_css, page_header, download_csv_button
+from utils.ui import inject_global_css, page_header, download_csv_button, render_qr_label
 from utils.nav import setup_sidebar
 
 logging.basicConfig(level=logging.INFO)
@@ -538,6 +538,10 @@ with tab4:
             i3.markdown(f"**图号**：{mold.get('mold_drawing_number') or '—'}")
             i4.markdown(f"**制造日期**：{mold.get('manufacturing_date') or '—'}")
             i1.markdown(f"**备注**：{mold.get('remarks') or '—'}")
+
+            # ── 二维码标签（打印贴模具，扫码枪扫描即可搜索定位）──
+            with st.expander("🏷️ 二维码标签（打印贴模）", expanded=False):
+                render_qr_label(mold['mold_code'], mold.get('mold_name', ''))
 
             # ── 寿命与保养 ──
             st.markdown("#### 📊 寿命与保养")

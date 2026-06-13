@@ -11,6 +11,9 @@ plotly==5.24.1
 # Auth
 bcrypt==4.2.1
 
+# QR 码标签（纯 Python，无额外依赖，离线可用）
+segno==1.6.6
+
 # System / Ops (psutil 6.0+ required for Python 3.13)
 psutil==6.1.1
 
