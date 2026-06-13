@@ -208,3 +208,36 @@ def activity_row(time_str: str, user: str, action: str, color: str = PRIMARY) ->
             </div>""",
         unsafe_allow_html=True,
     )
+
+
+def build_csv_bytes(data, columns=None) -> bytes:
+    """把 DataFrame 或 list[dict] 转为 Excel 友好的 CSV 字节（utf-8-sig 防中文乱码）。
+
+    columns 给定时按其顺序/子集导出。空数据返回仅含表头（或空）的内容。
+    与 Streamlit 解耦，便于单测。
+    """
+    import pandas as pd
+    df = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data or [])
+    if columns:
+        cols = [c for c in columns if c in df.columns]
+        if cols:
+            df = df[cols]
+    return df.to_csv(index=False).encode('utf-8-sig')
+
+
+def download_csv_button(data, filename_prefix: str, *, columns=None,
+                        label: str = "📥 导出 CSV", key=None) -> None:
+    """渲染"导出 CSV"下载按钮；文件名带当日日期。data 为空则按钮禁用。"""
+    from datetime import datetime
+    import pandas as pd
+    df = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data or [])
+    disabled = df.empty
+    st.download_button(
+        label,
+        build_csv_bytes(df, columns),
+        f"{filename_prefix}_{datetime.now().strftime('%Y%m%d')}.csv",
+        "text/csv",
+        key=key,
+        disabled=disabled,
+        help=("当前无数据可导出" if disabled else "导出当前筛选结果为 CSV（Excel 可直接打开）"),
+    )

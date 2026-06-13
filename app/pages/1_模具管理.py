@@ -10,7 +10,7 @@ from utils.database import (
     get_storage_locations, get_functional_types
 )
 from utils.auth import has_permission, log_user_action, restore_session
-from utils.ui import inject_global_css, page_header
+from utils.ui import inject_global_css, page_header, download_csv_button
 from utils.nav import setup_sidebar
 
 logging.basicConfig(level=logging.INFO)
@@ -245,13 +245,16 @@ with tab1:
         st.info("暂无符合条件的模具记录。")
     else:
         display_cols = ['模具编号', '模具名称', '功能类型', '当前状态', '存放位置',
-                        '累计模次', '理论寿命', '保养周期', '负责人']
+                        '累计模次', '理论寿命', '保养周期', '负责人', '制作人', '模具规格']
         st.dataframe(
             df[display_cols],
             use_container_width=True,
             hide_index=True,
         )
-        st.caption(f"当前第 {page} 页，显示 {len(df)} 条记录")
+        cap_col, dl_col = st.columns([3, 1])
+        cap_col.caption(f"当前第 {page} 页，显示 {len(df)} 条记录")
+        with dl_col:
+            download_csv_button(df[display_cols], "模具列表", key="export_molds")
 
         # 选中某行显示详情
         if not df.empty:

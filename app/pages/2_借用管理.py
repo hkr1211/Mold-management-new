@@ -527,15 +527,33 @@ def view_loan_applications():
         with col5:
             st.metric("⚠️ 逾期未还", overdue_count)
 
+        # 导出当前筛选结果
+        from utils.ui import download_csv_button
+        export_rows = [{
+            '申请ID': r.get('loan_id'),
+            '模具编号': r.get('mold_code'),
+            '模具名称': r.get('mold_name'),
+            '申请人': r.get('applicant_name'),
+            '状态': r.get('loan_status'),
+            '逾期天数': _overdue_days(r),
+            '申请时间': _format_loan_datetime(r.get('application_timestamp'), '%Y-%m-%d %H:%M'),
+            '预计归还': _format_loan_datetime(r.get('expected_return_timestamp'), '%Y-%m-%d'),
+            '实际归还': _format_loan_datetime(r.get('actual_return_timestamp'), '%Y-%m-%d %H:%M'),
+            '用途': r.get('destination_equipment'),
+        } for r in loan_apps_result]
+        _, dl_col = st.columns([3, 1])
+        with dl_col:
+            download_csv_button(export_rows, "借用记录", key="export_loans")
+
         # 显示申请列表
         status_emoji = {
-            "待审批": "⏳", 
-            "已批准": "✅", 
+            "待审批": "⏳",
+            "已批准": "✅",
             "已批准待借出": "🎯",
             "已借出": "➡️",
-            "已归还": "📥", 
-            "已驳回": "❌", 
-            "逾期": "⚠️" 
+            "已归还": "📥",
+            "已驳回": "❌",
+            "逾期": "⚠️"
         }
 
         for record in loan_apps_result:

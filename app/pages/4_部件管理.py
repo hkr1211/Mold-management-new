@@ -6,7 +6,7 @@ import sqlite3
 from datetime import date
 from utils.database import execute_query
 from utils.auth import has_permission, log_user_action, restore_session
-from utils.ui import inject_global_css, page_header
+from utils.ui import inject_global_css, page_header, download_csv_button
 from utils.nav import setup_sidebar
 
 logging.basicConfig(level=logging.INFO)
@@ -140,7 +140,10 @@ def show_parts_list():
 
     display_cols = ['部件编号', '部件名称', '所属模具', '部件类别', '材质', '安装日期', '设计寿命', '状态']
     st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-    st.caption(f"当前第 {page} 页，显示 {len(df)} 条记录")
+    cap_col, dl_col = st.columns([3, 1])
+    cap_col.caption(f"当前第 {page} 页，显示 {len(df)} 条记录")
+    with dl_col:
+        download_csv_button(df[display_cols], "部件列表", key="export_parts")
 
     if CAN_MANAGE:
         with st.expander("🗑️ 删除部件", expanded=False):
