@@ -241,35 +241,53 @@ with tab1:
 
     df = _load_or_stop(load_molds, keyword.strip(), status_filter, page, page_size)
 
+    can_manage = has_permission('manage_molds')
+    can_loan = has_permission('create_loan') or can_manage
+    can_maintain = has_permission('manage_maintenance') or can_manage
+
     if df.empty:
         st.info("暂无符合条件的模具记录。")
     else:
-        display_cols = ['模具编号', '模具名称', '功能类型', '当前状态', '存放位置',
-                        '累计模次', '理论寿命', '保养周期', '负责人', '制作人', '模具规格']
-        st.dataframe(
-            df[display_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
+        export_cols = ['模具编号', '模具名称', '功能类型', '当前状态', '存放位置',
+                       '累计模次', '理论寿命', '保养周期', '负责人', '制作人', '模具规格']
         cap_col, dl_col = st.columns([3, 1])
         cap_col.caption(f"当前第 {page} 页，显示 {len(df)} 条记录")
         with dl_col:
-            download_csv_button(df[display_cols], "模具列表", key="export_molds")
+            download_csv_button(df[export_cols], "模具列表", key="export_molds")
 
-        # 选中某行显示详情
-        if not df.empty:
-            with st.expander("🔍 查看详情", expanded=False):
-                selected_code = st.selectbox(
-                    "选择模具编号",
-                    df['模具编号'].tolist(),
-                    key="detail_select"
-                )
-                row = df[df['模具编号'] == selected_code].iloc[0]
-                c1, c2 = st.columns(2)
-                for i, (col, val) in enumerate(row.items()):
-                    if col == 'mold_id':
-                        continue
-                    (c1 if i % 2 == 0 else c2).markdown(f"**{col}**：{val}")
+        # 表头
+        col_w = [2, 2.4, 1.4, 1.4, 1.2, 2.4]
+        h = st.columns(col_w)
+        for c, t in zip(h, ["模具编号", "模具名称", "状态", "累计模次", "负责人", "操作"]):
+            c.markdown(f"**{t}**")
+        st.divider()
+
+        # 逐行：数据 + 行内操作按钮
+        if 'edit_mold_code' in st.session_state:
+            st.info(f"✏️ 已选择 **{st.session_state['edit_mold_code']}** 待编辑 → "
+                    f"请点击上方「✏️ 编辑模具」标签查看/修改。")
+
+        for _, r in df.iterrows():
+            mid = int(r['mold_id'])
+            code = r['模具编号']
+            c = st.columns(col_w)
+            c[0].write(code)
+            c[1].write(r['模具名称'])
+            c[2].write(r['当前状态'] or '—')
+            c[3].write(f"{int(r['累计模次'] or 0):,}")
+            c[4].write(r['负责人'] or '—')
+            with c[5]:
+                b1, b2, b3 = st.columns(3)
+                if can_manage and b1.button("编辑", key=f"edit_{mid}", help="载入到编辑标签"):
+                    st.session_state['edit_mold_code'] = code
+                    st.rerun()
+                if can_loan and b2.button("借用", key=f"loan_{mid}", help="发起借用申请"):
+                    st.session_state['preselect_loan_mold_id'] = mid
+                    st.switch_page("pages/2_借用管理.py")
+                if can_maintain and b3.button("维修", key=f"maint_{mid}", help="创建维修保养任务"):
+                    st.session_state['create_maintenance_mold_id'] = mid
+                    st.session_state['maintenance_tab'] = 'create_task'
+                    st.switch_page("pages/3_维修管理.py")
 
 # ========== TAB2：新增模具 ==========
 with tab2:
