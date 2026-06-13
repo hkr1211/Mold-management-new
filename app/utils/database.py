@@ -254,7 +254,7 @@ def get_all_molds(offset: int = 0, limit: int = DEFAULT_PAGE_SIZE) -> List[Dict]
         SELECT
             m.mold_id, m.mold_code, m.mold_name, m.mold_drawing_number,
             mft.type_name  AS functional_type,
-            m.supplier, m.manufacturing_date,
+            m.maker, m.specification, m.manufacturing_date,
             m.theoretical_lifespan_strokes, m.accumulated_strokes,
             m.maintenance_cycle_strokes,
             ms.status_name   AS current_status,
@@ -536,6 +536,27 @@ def clear_cache():
         logger.error(f"清除缓存失败: {e}")
 
 # ── 初始化 ───────────────────────────────────────────────────────────
+def _migrate_legacy_schema(conn) -> None:
+    """对既有库做向前迁移（新库由 sqlite_init.sql 直接建出目标结构）。
+
+    自包含使用传入的 conn，便于独立测试；重复执行幂等。
+    """
+    mold_cols = {row[1] for row in conn.execute("PRAGMA table_info(molds)")}
+    if not mold_cols:
+        return  # molds 尚不存在（理论上 executescript 之后不会发生）
+
+    # 2026-06-12: 模具"供应商"语义改为"制作人"（supplier → maker）
+    if 'supplier' in mold_cols and 'maker' not in mold_cols:
+        conn.execute("ALTER TABLE molds RENAME COLUMN supplier TO maker")
+        logger.info("迁移: molds.supplier → maker（制作人），数据保留")
+        mold_cols = (mold_cols - {'supplier'}) | {'maker'}
+
+    # 2026-06-12: 新增模具规格（具体尺寸数据）
+    if 'specification' not in mold_cols:
+        conn.execute("ALTER TABLE molds ADD COLUMN specification TEXT")
+        logger.info("迁移: molds 补充列 specification（模具规格）")
+
+
 def initialize_database():
     try:
         _get_conn()  # 确保连接和目录已创建
@@ -570,6 +591,8 @@ def initialize_database():
                             f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}"
                         )
                         logger.info(f"已为 {table_name} 补充兼容列: {column_name}")
+
+            _migrate_legacy_schema(conn)
             conn.commit()
         else:
             logger.warning(f"初始化 SQL 文件不存在: {init_sql_path}")

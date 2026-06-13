@@ -759,7 +759,24 @@ def view_maintenance_tasks():
             st.metric("进行中", in_progress_records)
         with col4:
             st.metric("总成本", f"¥{total_cost:,.2f}")
-        
+
+        # 导出当前筛选结果
+        from utils.ui import download_csv_button
+        export_rows = [{
+            '模具编号': r.get('mold_code'),
+            '模具名称': r.get('mold_name'),
+            '类型': '维修' if r.get('is_repair') else '保养',
+            '技师': r.get('maintained_by'),
+            '结果状态': r.get('result_status'),
+            '开始时间': r.get('maintenance_start_timestamp'),
+            '结束时间': r.get('maintenance_end_timestamp'),
+            '费用': r.get('maintenance_cost'),
+            '说明': r.get('problem_description'),
+        } for r in maintenance_records]
+        _, dl_col = st.columns([3, 1])
+        with dl_col:
+            download_csv_button(export_rows, "维修记录", key="export_maintenance")
+
         # 详细记录列表
         st.markdown("---")
         

@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS molds (
     mold_name                   TEXT    NOT NULL,
     mold_drawing_number         TEXT,
     mold_functional_type_id     INTEGER REFERENCES mold_functional_types(type_id),
-    supplier                    TEXT,
+    maker                       TEXT,
+    specification               TEXT,
     manufacturing_date          TEXT,
     theoretical_lifespan_strokes INTEGER,
     accumulated_strokes         INTEGER DEFAULT 0,
@@ -348,6 +349,7 @@ ON CONFLICT(location_name) DO UPDATE SET description = excluded.description;
 INSERT INTO mold_part_categories (category_name, description) VALUES
     ('凸模',   '冲头类零件'),
     ('凹模',   '凹模类零件'),
+    ('压边圈', '拉延模压边圈部件'),
     ('导柱导套','导向零件'),
     ('弹簧',   '弹性元件'),
     ('螺钉销钉','紧固件'),

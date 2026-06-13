@@ -72,6 +72,7 @@ def _load_page(st_mock, extra_modules=None):
     ui = types.ModuleType("utils.ui")
     ui.inject_global_css = lambda: None
     ui.page_header = lambda *a, **kw: None
+    ui.download_csv_button = lambda *a, **kw: None
     sys.modules["utils.ui"] = ui
 
     database = types.ModuleType("utils.database")
