@@ -250,6 +250,45 @@ def get_user_technicians():
         st.error(f"获取模具工列表失败: {e}")
         return []
 
+def get_replaced_parts(log_id):
+    """获取某条维修记录关联的更换部件。"""
+    try:
+        return execute_query(
+            """
+            SELECT p.part_name, p.part_code, rp.quantity
+            FROM maintenance_replaced_parts rp
+            JOIN mold_parts p ON rp.part_id = p.part_id
+            WHERE rp.log_id = %s
+            ORDER BY p.part_code, p.part_name
+            """,
+            params=(log_id,), fetch_all=True) or []
+    except sqlite3.Error as e:
+        logging.error(f"获取更换部件失败: {e}")
+        return []
+
+
+def get_replaced_parts_ids(log_id):
+    """某维修记录已关联的部件 id 列表（用于编辑时去重）。"""
+    try:
+        return execute_query(
+            "SELECT part_id FROM maintenance_replaced_parts WHERE log_id = %s",
+            params=(log_id,), fetch_all=True) or []
+    except sqlite3.Error:
+        return []
+
+
+def get_mold_parts_for_select(mold_id):
+    """获取某模具已登记的部件（用于维修表单的更换部件多选）。"""
+    try:
+        return execute_query(
+            "SELECT part_id, part_code, part_name FROM mold_parts "
+            "WHERE mold_id = %s ORDER BY part_code, part_name",
+            params=(mold_id,), fetch_all=True) or []
+    except sqlite3.Error as e:
+        st.error(f"获取模具部件失败: {e}")
+        return []
+
+
 def search_molds_for_maintenance(search_term=""):
     """搜索模具用于维修保养"""
     base_query = """
@@ -515,15 +554,25 @@ def create_maintenance_task():
             height=100
         )
         
-        # 更换部件信息
-        st.markdown("**更换部件信息** (可选)")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            part_name = st.text_input("部件名称", placeholder="例如: 压边圈")
-        with col2:
-            part_code = st.text_input("部件编号", placeholder="例如: PC001")
-        with col3:
-            part_quantity = st.number_input("数量", min_value=0, value=0)
+        # 更换部件信息（从该模具已登记部件中选择，可多选）
+        st.markdown("**更换部件** (可选)")
+        mold_parts = get_mold_parts_for_select(selected_mold_id)
+        if mold_parts:
+            part_label = {
+                p['part_id']: f"{p['part_name']}"
+                + (f"（{p['part_code']}）" if p.get('part_code') else "")
+                for p in mold_parts
+            }
+            replaced_part_ids = st.multiselect(
+                "本次更换的部件",
+                options=list(part_label.keys()),
+                format_func=lambda pid: part_label[pid],
+                help="从该模具已登记的部件中选择；更换记录会关联到本次维修，"
+                     "并显示在模具履历中。"
+            )
+        else:
+            replaced_part_ids = []
+            st.caption("该模具暂无已登记部件。可先在「部件管理」录入部件后再关联。")
         
         # 备注
         notes = st.text_area("备注", placeholder="其他需要说明的信息...")
@@ -551,16 +600,7 @@ def create_maintenance_task():
             if end_time_enabled and maintenance_end_date and maintenance_end_time:
                 end_datetime = datetime.combine(maintenance_end_date, maintenance_end_time)
             
-            # 构建更换部件信息
-            replaced_parts_info = None
-            if part_name and part_quantity > 0:
-                replaced_parts_info = [{
-                    "part_name": part_name,
-                    "part_code": part_code or None,
-                    "quantity": part_quantity
-                }]
-            
-            # 保存维修记录
+            # 保存维修记录（含更换部件关联）
             success = save_maintenance_record(
                 mold_id=selected_mold_id,
                 maintenance_type_id=maintenance_type_id,
@@ -571,7 +611,7 @@ def create_maintenance_task():
                 actions_taken=actions_taken,
                 maintenance_cost=maintenance_cost if maintenance_cost > 0 else None,
                 result_status_id=result_status_id,
-                replaced_parts_info=replaced_parts_info,
+                replaced_part_ids=replaced_part_ids,
                 notes=notes
             )
             
@@ -591,7 +631,7 @@ def create_maintenance_task():
 
 def save_maintenance_record(mold_id, maintenance_type_id, maintained_by_id, start_timestamp,
                           end_timestamp=None, problem_description=None, actions_taken=None,
-                          maintenance_cost=None, result_status_id=None, replaced_parts_info=None,
+                          maintenance_cost=None, result_status_id=None, replaced_part_ids=None,
                           notes=None):
     """保存维修保养记录"""
     try:
@@ -661,7 +701,15 @@ def save_maintenance_record(mold_id, maintenance_type_id, maintained_by_id, star
             ))
             
             log_id = cursor.fetchone()[0]
-            
+
+            # 关联本次更换的部件（同事务）
+            for pid in (replaced_part_ids or []):
+                cursor.execute(
+                    "INSERT INTO maintenance_replaced_parts (log_id, part_id, quantity) "
+                    "VALUES (%s, %s, 1)",
+                    (log_id, pid)
+                )
+
             # 如果任务已完成，更新模具状态
             if end_timestamp and result_status_id:
                 # 获取结果状态名称
@@ -835,16 +883,13 @@ def view_maintenance_tasks():
                     st.markdown("**处理措施:**")
                     st.info(record['actions_taken'])
                 
-                # 更换部件信息
-                if record['replaced_parts_info']:
-                    try:
-                        import json
-                        parts_info = json.loads(record['replaced_parts_info'])
-                        st.markdown("**更换部件:**")
-                        for part in parts_info:
-                            st.write(f"- {part.get('part_name', '')} ({part.get('part_code', '')}) x{part.get('quantity', 0)}")
-                    except:
-                        pass
+                # 更换部件信息（关联表）
+                replaced = get_replaced_parts(record['log_id'])
+                if replaced:
+                    st.markdown("**更换部件:**")
+                    for p in replaced:
+                        code = f"（{p['part_code']}）" if p.get('part_code') else ""
+                        st.write(f"- {p['part_name']}{code} ×{p['quantity']}")
                 
                 if record['notes']:
                     st.markdown("**备注:**")
@@ -972,15 +1017,27 @@ def update_maintenance_task():
                 help="补充或更新备注信息"
             )
             
-            # 新增更换部件
+            # 新增更换部件（从该模具已登记部件中选择）
             st.markdown("**新增更换部件** (可选)")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                new_part_name = st.text_input("部件名称", placeholder="例如: 密封圈")
-            with col2:
-                new_part_code = st.text_input("部件编号", placeholder="例如: S001")
-            with col3:
-                new_part_quantity = st.number_input("数量", min_value=0, value=0)
+            already = {p['part_id'] for p in get_replaced_parts_ids(task['log_id'])}
+            add_part_options = [
+                p for p in get_mold_parts_for_select(task['mold_id'])
+                if p['part_id'] not in already
+            ]
+            if add_part_options:
+                _lbl = {
+                    p['part_id']: p['part_name'] + (f"（{p['part_code']}）" if p.get('part_code') else "")
+                    for p in add_part_options
+                }
+                new_replaced_part_ids = st.multiselect(
+                    "本次新增更换的部件",
+                    options=list(_lbl.keys()),
+                    format_func=lambda pid: _lbl[pid],
+                    help="从该模具已登记、且本维修记录尚未关联的部件中选择"
+                )
+            else:
+                new_replaced_part_ids = []
+                st.caption("无可新增的部件（该模具无已登记部件，或均已关联）。")
             
             # 提交按钮
             col1, col2 = st.columns([1, 3])
@@ -1042,28 +1099,16 @@ def update_maintenance_task():
                             update_fields.append("description = %s")
                             update_params.append(merged_description)
                         
-                        # 更换部件信息更新
-                        if new_part_name and new_part_quantity > 0:
-                            # 获取现有部件信息
-                            current_parts = []
-                            if task['replaced_parts_info']:
-                                try:
-                                    import json
-                                    current_parts = json.loads(task['replaced_parts_info'])
-                                except:
-                                    current_parts = []
-                            
-                            # 添加新部件
-                            new_part = {
-                                "part_name": new_part_name,
-                                "part_code": new_part_code or None,
-                                "quantity": new_part_quantity
-                            }
-                            current_parts.append(new_part)
-                            
-                            import json
-                            # 当前 SQLite schema 无 replaced_parts_info 字段，暂不单独持久化
-                        
+                        # 新增更换部件关联（写入关联表）
+                        for _pid in new_replaced_part_ids:
+                            try:
+                                execute_query(
+                                    "INSERT INTO maintenance_replaced_parts "
+                                    "(log_id, part_id, quantity) VALUES (%s, %s, 1)",
+                                    params=(task['log_id'], _pid), commit=True)
+                            except sqlite3.Error as e:
+                                st.error(f"关联部件失败: {e}")
+
                         # 执行更新
                         if update_fields:
                             update_query = f"""

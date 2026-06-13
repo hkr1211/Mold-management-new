@@ -183,6 +183,18 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 );
 CREATE INDEX IF NOT EXISTS ix_user_sessions_user ON user_sessions(user_id);
 
+-- ── 维修更换部件关联（一次维修记录更换了哪些已登记部件）────────────
+CREATE TABLE IF NOT EXISTS maintenance_replaced_parts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    log_id     INTEGER NOT NULL REFERENCES mold_maintenance_logs(log_id) ON DELETE CASCADE,
+    part_id    INTEGER NOT NULL REFERENCES mold_parts(part_id),
+    quantity   INTEGER NOT NULL DEFAULT 1,
+    remarks    TEXT,
+    created_at TEXT    DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_maint_replaced_log  ON maintenance_replaced_parts(log_id);
+CREATE INDEX IF NOT EXISTS ix_maint_replaced_part ON maintenance_replaced_parts(part_id);
+
 -- ── 模次累计流水（molds.accumulated_strokes 的唯一审计来源）──────────
 -- source_type: loan_return（借用归还）/ schedule_complete（排程完工）/ manual_adjust（台账手动调整）
 CREATE TABLE IF NOT EXISTS mold_stroke_logs (
