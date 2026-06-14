@@ -10,7 +10,8 @@ from utils.database import (
     get_storage_locations, get_functional_types
 )
 from utils.auth import has_permission, log_user_action, restore_session
-from utils.ui import inject_global_css, page_header, download_csv_button
+from utils.ui import inject_global_css, page_header, download_csv_button, render_qr_label
+from utils import mold_io
 from utils.nav import setup_sidebar
 
 logging.basicConfig(level=logging.INFO)
@@ -102,6 +103,125 @@ def load_lookup_data():
         fetch_all=True
     ) or []
     return statuses, locations, types, users_raw
+
+# --- 模具编辑表单（tab3 与列表行内编辑共用）---
+
+def render_mold_editor(code_to_edit, key_prefix="edit"):
+    """渲染并处理单个模具的编辑表单。key_prefix 用于隔离 widget，
+    使列表行内编辑与「编辑模具」标签可在同一次运行中并存而不冲突。"""
+    mold_row = _load_or_stop(
+        execute_query,
+        """
+        SELECT m.*, ms.status_name, sl.location_name, mft.type_name,
+               u.full_name as responsible_name
+        FROM molds m
+        LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
+        LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
+        LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
+        LEFT JOIN users u ON m.responsible_person_id = u.user_id
+        WHERE m.mold_code = %s
+        """,
+        params=(code_to_edit,), fetch_one=True
+    )
+    if not mold_row:
+        st.error(f"❌ 未找到模具编号：{code_to_edit}")
+        return
+
+    statuses, locations, types, users_raw = _load_or_stop(load_lookup_data)
+    status_options = {s['status_name']: s['status_id'] for s in statuses}
+    location_options = {l['location_name']: l['location_id'] for l in locations}
+    user_options = {u['full_name']: u['user_id'] for u in users_raw}
+
+    with st.form(f"{key_prefix}_mold_form"):
+        st.subheader(f"编辑：{mold_row['mold_code']} — {mold_row['mold_name']}")
+        c1, c2 = st.columns(2)
+        new_name = c1.text_input("模具名称 *", value=mold_row.get('mold_name', ''),
+                                 key=f"{key_prefix}_name")
+        new_maker = c2.text_input("制作人", value=mold_row.get('maker', '') or '',
+                                  key=f"{key_prefix}_maker")
+        new_specification = c1.text_input(
+            "模具规格", value=mold_row.get('specification', '') or '',
+            placeholder="具体尺寸，例：1200×800×650mm", key=f"{key_prefix}_spec")
+
+        c3, c4 = st.columns(2)
+        status_keys = list(status_options.keys())
+        cur_status = mold_row.get('status_name', '')
+        s_idx = status_keys.index(cur_status) if cur_status in status_keys else 0
+        new_status = c3.selectbox("状态", status_keys, index=s_idx, key=f"{key_prefix}_status")
+
+        loc_keys = ["（未选择）"] + list(location_options.keys())
+        cur_loc = mold_row.get('location_name', '')
+        l_idx = loc_keys.index(cur_loc) if cur_loc in loc_keys else 0
+        new_location = c4.selectbox("存放位置", loc_keys, index=l_idx, key=f"{key_prefix}_loc")
+
+        c5, c6, c7 = st.columns(3)
+        new_lifespan = c5.number_input(
+            "理论寿命", min_value=0,
+            value=int(mold_row.get('theoretical_lifespan_strokes') or 0), key=f"{key_prefix}_life")
+        new_cycle = c6.number_input(
+            "保养周期", min_value=0,
+            value=int(mold_row.get('maintenance_cycle_strokes') or 0), key=f"{key_prefix}_cycle")
+        new_accumulated = c7.number_input(
+            "累计模次", min_value=0,
+            value=int(mold_row.get('accumulated_strokes') or 0), key=f"{key_prefix}_acc")
+
+        resp_keys = ["（未选择）"] + list(user_options.keys())
+        cur_resp = mold_row.get('responsible_name', '')
+        r_idx = resp_keys.index(cur_resp) if cur_resp in resp_keys else 0
+        new_responsible = st.selectbox("负责人", resp_keys, index=r_idx, key=f"{key_prefix}_resp")
+        new_remarks = st.text_area("备注", value=mold_row.get('remarks', '') or '',
+                                   key=f"{key_prefix}_remarks")
+
+        save = st.form_submit_button("💾 保存修改", type="primary")
+
+    if save:
+        if not new_name.strip():
+            st.error("❌ 模具名称不能为空")
+            return
+        loc_id = location_options.get(new_location) if new_location != "（未选择）" else None
+        resp_id = user_options.get(new_responsible) if new_responsible != "（未选择）" else None
+        update_sql = """
+        UPDATE molds SET
+            mold_name = %s, maker = %s, specification = %s,
+            current_status_id = %s, current_location_id = %s,
+            theoretical_lifespan_strokes = %s,
+            maintenance_cycle_strokes = %s, accumulated_strokes = %s,
+            responsible_person_id = %s, remarks = %s,
+            updated_at = NOW()
+        WHERE mold_code = %s
+        """
+        try:
+            execute_query(update_sql, params=(
+                new_name.strip(), new_maker.strip() or None,
+                new_specification.strip() or None,
+                status_options[new_status], loc_id,
+                new_lifespan, new_cycle, new_accumulated,
+                resp_id, new_remarks.strip() or None,
+                code_to_edit
+            ), commit=True)
+            # 手动改动累计模次 → 记入模次流水（manual_adjust），保证台账可审计
+            old_accumulated = int(mold_row.get('accumulated_strokes') or 0)
+            delta = int(new_accumulated) - old_accumulated
+            if delta != 0:
+                execute_query(
+                    "INSERT INTO mold_stroke_logs "
+                    "(mold_id, strokes_added, source_type, source_id, operator_id, remarks) "
+                    "VALUES (%s, %s, 'manual_adjust', %s, %s, %s)",
+                    params=(mold_row['mold_id'], delta, code_to_edit,
+                            st.session_state.get('user_id'),
+                            f"台账编辑：{old_accumulated} → {new_accumulated}"),
+                    commit=True
+                )
+            log_user_action('UPDATE_MOLD', 'molds', code_to_edit)
+            st.success(f"✅ 模具 {code_to_edit} 更新成功！")
+            st.cache_data.clear()
+            if 'edit_mold_code' in st.session_state:
+                del st.session_state['edit_mold_code']
+            st.rerun()
+        except sqlite3.Error as e:
+            logger.error(f"更新模具失败: {e}")
+            st.error(f"❌ 更新失败：{e}")
+
 
 # --- 模具履历（一页式）查询与计算 ---
 
@@ -216,7 +336,8 @@ def _last_maintenance_strokes(mold_id):
 
 # --- 主页面 ---
 
-tab1, tab2, tab3, tab4 = st.tabs(["📋 模具列表", "➕ 新增模具", "✏️ 编辑模具", "📜 模具履历"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📋 模具列表", "➕ 新增模具", "✏️ 编辑模具", "📜 模具履历", "📦 批量导入/导出"])
 
 # ========== TAB1：模具列表 ==========
 with tab1:
@@ -241,35 +362,61 @@ with tab1:
 
     df = _load_or_stop(load_molds, keyword.strip(), status_filter, page, page_size)
 
+    can_manage = has_permission('manage_molds')
+    can_loan = has_permission('create_loan') or can_manage
+    can_maintain = has_permission('manage_maintenance') or can_manage
+
+    # 行内"编辑"按钮触发：就地展开编辑表单（一步到位，无需切标签）
+    if can_manage and st.session_state.get('edit_mold_code'):
+        ec = st.session_state['edit_mold_code']
+        with st.container(border=True):
+            t1, t2 = st.columns([5, 1])
+            t1.markdown(f"#### ✏️ 编辑模具 {ec}")
+            if t2.button("✖ 关闭", key="close_inline_edit"):
+                del st.session_state['edit_mold_code']
+                st.rerun()
+            render_mold_editor(ec, key_prefix="inline")
+        st.divider()
+
     if df.empty:
         st.info("暂无符合条件的模具记录。")
     else:
-        display_cols = ['模具编号', '模具名称', '功能类型', '当前状态', '存放位置',
-                        '累计模次', '理论寿命', '保养周期', '负责人', '制作人', '模具规格']
-        st.dataframe(
-            df[display_cols],
-            use_container_width=True,
-            hide_index=True,
-        )
+        export_cols = ['模具编号', '模具名称', '功能类型', '当前状态', '存放位置',
+                       '累计模次', '理论寿命', '保养周期', '负责人', '制作人', '模具规格']
         cap_col, dl_col = st.columns([3, 1])
         cap_col.caption(f"当前第 {page} 页，显示 {len(df)} 条记录")
         with dl_col:
-            download_csv_button(df[display_cols], "模具列表", key="export_molds")
+            download_csv_button(df[export_cols], "模具列表", key="export_molds")
 
-        # 选中某行显示详情
-        if not df.empty:
-            with st.expander("🔍 查看详情", expanded=False):
-                selected_code = st.selectbox(
-                    "选择模具编号",
-                    df['模具编号'].tolist(),
-                    key="detail_select"
-                )
-                row = df[df['模具编号'] == selected_code].iloc[0]
-                c1, c2 = st.columns(2)
-                for i, (col, val) in enumerate(row.items()):
-                    if col == 'mold_id':
-                        continue
-                    (c1 if i % 2 == 0 else c2).markdown(f"**{col}**：{val}")
+        # 表头
+        col_w = [2, 2.4, 1.4, 1.4, 1.2, 2.4]
+        h = st.columns(col_w)
+        for c, t in zip(h, ["模具编号", "模具名称", "状态", "累计模次", "负责人", "操作"]):
+            c.markdown(f"**{t}**")
+        st.divider()
+
+        # 逐行：数据 + 行内操作按钮
+        for _, r in df.iterrows():
+            mid = int(r['mold_id'])
+            code = r['模具编号']
+            c = st.columns(col_w)
+            c[0].write(code)
+            c[1].write(r['模具名称'])
+            c[2].write(r['当前状态'] or '—')
+            c[3].write(f"{int(r['累计模次'] or 0):,}")
+            c[4].write(r['负责人'] or '—')
+            with c[5]:
+                b1, b2, b3 = st.columns(3)
+                if can_manage and b1.button("编辑", key=f"edit_{mid}", help="载入到编辑标签"):
+                    st.session_state['edit_mold_code'] = code
+                    st.rerun()
+                if can_loan and b2.button("借用", key=f"loan_{mid}", help="发起借用申请"):
+                    st.session_state['preselect_loan_mold_id'] = mid
+                    st.switch_page("pages/2_借用管理.py")
+                if can_maintain and b3.button("维修", key=f"maint_{mid}", help="创建维修保养任务"):
+                    st.session_state['create_maintenance_mold_id'] = mid
+                    st.session_state['maintenance_tab'] = 'create_task'
+                    st.switch_page("pages/3_维修管理.py")
 
 # ========== TAB2：新增模具 ==========
 with tab2:
@@ -372,117 +519,7 @@ with tab3:
 
         code_to_edit = st.session_state.get('edit_mold_code', '')
         if code_to_edit:
-            mold_row = _load_or_stop(
-                execute_query,
-                """
-                SELECT m.*, ms.status_name, sl.location_name, mft.type_name,
-                       u.full_name as responsible_name
-                FROM molds m
-                LEFT JOIN mold_statuses ms ON m.current_status_id = ms.status_id
-                LEFT JOIN storage_locations sl ON m.current_location_id = sl.location_id
-                LEFT JOIN mold_functional_types mft ON m.mold_functional_type_id = mft.type_id
-                LEFT JOIN users u ON m.responsible_person_id = u.user_id
-                WHERE m.mold_code = %s
-                """,
-                params=(code_to_edit,), fetch_one=True
-            )
-
-            if not mold_row:
-                st.error(f"❌ 未找到模具编号：{code_to_edit}")
-            else:
-                statuses, locations, types, users_raw = _load_or_stop(load_lookup_data)
-                status_options = {s['status_name']: s['status_id'] for s in statuses}
-                location_options = {l['location_name']: l['location_id'] for l in locations}
-                type_options = {t['type_name']: t['type_id'] for t in types}
-                user_options = {u['full_name']: u['user_id'] for u in users_raw}
-
-                with st.form("edit_mold_form"):
-                    st.subheader(f"编辑：{mold_row['mold_code']} — {mold_row['mold_name']}")
-                    c1, c2 = st.columns(2)
-                    new_name = c1.text_input("模具名称 *", value=mold_row.get('mold_name', ''))
-                    new_maker = c2.text_input("制作人", value=mold_row.get('maker', '') or '')
-                    new_specification = c1.text_input(
-                        "模具规格", value=mold_row.get('specification', '') or '',
-                        placeholder="具体尺寸，例：1200×800×650mm")
-
-                    c3, c4 = st.columns(2)
-                    cur_status = mold_row.get('status_name', '')
-                    status_keys = list(status_options.keys())
-                    s_idx = status_keys.index(cur_status) if cur_status in status_keys else 0
-                    new_status = c3.selectbox("状态", status_keys, index=s_idx)
-
-                    cur_loc = mold_row.get('location_name', '')
-                    loc_keys = ["（未选择）"] + list(location_options.keys())
-                    l_idx = loc_keys.index(cur_loc) if cur_loc in loc_keys else 0
-                    new_location = c4.selectbox("存放位置", loc_keys, index=l_idx)
-
-                    c5, c6, c7 = st.columns(3)
-                    new_lifespan = c5.number_input(
-                        "理论寿命", min_value=0,
-                        value=int(mold_row.get('theoretical_lifespan_strokes') or 0)
-                    )
-                    new_cycle = c6.number_input(
-                        "保养周期", min_value=0,
-                        value=int(mold_row.get('maintenance_cycle_strokes') or 0)
-                    )
-                    new_accumulated = c7.number_input(
-                        "累计模次", min_value=0,
-                        value=int(mold_row.get('accumulated_strokes') or 0)
-                    )
-
-                    cur_resp = mold_row.get('responsible_name', '')
-                    resp_keys = ["（未选择）"] + list(user_options.keys())
-                    r_idx = resp_keys.index(cur_resp) if cur_resp in resp_keys else 0
-                    new_responsible = st.selectbox("负责人", resp_keys, index=r_idx)
-                    new_remarks = st.text_area("备注", value=mold_row.get('remarks', '') or '')
-
-                    save = st.form_submit_button("💾 保存修改", type="primary")
-
-                if save:
-                    if not new_name.strip():
-                        st.error("❌ 模具名称不能为空")
-                    else:
-                        loc_id = location_options.get(new_location) if new_location != "（未选择）" else None
-                        resp_id = user_options.get(new_responsible) if new_responsible != "（未选择）" else None
-                        update_sql = """
-                        UPDATE molds SET
-                            mold_name = %s, maker = %s, specification = %s,
-                            current_status_id = %s, current_location_id = %s,
-                            theoretical_lifespan_strokes = %s,
-                            maintenance_cycle_strokes = %s, accumulated_strokes = %s,
-                            responsible_person_id = %s, remarks = %s,
-                            updated_at = NOW()
-                        WHERE mold_code = %s
-                        """
-                        try:
-                            execute_query(update_sql, params=(
-                                new_name.strip(), new_maker.strip() or None,
-                                new_specification.strip() or None,
-                                status_options[new_status], loc_id,
-                                new_lifespan, new_cycle, new_accumulated,
-                                resp_id, new_remarks.strip() or None,
-                                code_to_edit
-                            ), commit=True)
-                            # 手动改动累计模次 → 记入模次流水（manual_adjust），保证台账可审计
-                            old_accumulated = int(mold_row.get('accumulated_strokes') or 0)
-                            delta = int(new_accumulated) - old_accumulated
-                            if delta != 0:
-                                execute_query(
-                                    "INSERT INTO mold_stroke_logs "
-                                    "(mold_id, strokes_added, source_type, source_id, operator_id, remarks) "
-                                    "VALUES (%s, %s, 'manual_adjust', %s, %s, %s)",
-                                    params=(mold_row['mold_id'], delta, code_to_edit,
-                                            st.session_state.get('user_id'),
-                                            f"台账编辑：{old_accumulated} → {new_accumulated}"),
-                                    commit=True
-                                )
-                            log_user_action('UPDATE_MOLD', 'molds', code_to_edit)
-                            st.success(f"✅ 模具 {code_to_edit} 更新成功！")
-                            st.cache_data.clear()
-                            del st.session_state['edit_mold_code']
-                        except sqlite3.Error as e:
-                            logger.error(f"更新模具失败: {e}")
-                            st.error(f"❌ 更新失败：{e}")
+            render_mold_editor(code_to_edit, key_prefix="tab3")
 
 # ========== TAB4：模具履历（一页式） ==========
 with tab4:
@@ -538,6 +575,10 @@ with tab4:
             i3.markdown(f"**图号**：{mold.get('mold_drawing_number') or '—'}")
             i4.markdown(f"**制造日期**：{mold.get('manufacturing_date') or '—'}")
             i1.markdown(f"**备注**：{mold.get('remarks') or '—'}")
+
+            # ── 二维码标签（打印贴模具，扫码枪扫描即可搜索定位）──
+            with st.expander("🏷️ 二维码标签（打印贴模）", expanded=False):
+                render_qr_label(mold['mold_code'], mold.get('mold_name', ''))
 
             # ── 寿命与保养 ──
             st.markdown("#### 📊 寿命与保养")
@@ -618,3 +659,65 @@ with tab4:
                                  use_container_width=True)
                 else:
                     st.caption("暂无流水")
+
+# ========== TAB5：批量导入/导出 ==========
+with tab5:
+    _XLSX_MIME = "application/vnd.openpyxl-spreadsheetml.sheet"
+    if not has_permission('manage_molds'):
+        st.warning("🔒 您的角色没有批量导入/导出模具的权限。")
+    else:
+        st.markdown("#### ⬇️ 下载")
+        st.caption("「空模板」仅含表头，供按格式填写；「导出全部」含现有模具数据，"
+                   "可改后再导回。带 * 列为必填；功能类型/状态/存放位置/负责人按"
+                   "**名称**填写，需与主数据一致。")
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "📄 下载空模板（仅表头）", mold_io.build_template_bytes(),
+                "模具导入模板.xlsx", mime=_XLSX_MIME, key="dl_tpl")
+        with d2:
+            try:
+                rows = execute_query(mold_io.export_query(), fetch_all=True) or []
+            except sqlite3.Error as e:
+                rows = []
+                st.error(f"导出数据加载失败：{e}")
+            st.download_button(
+                f"📦 导出全部模具（{len(rows)} 条）", mold_io.build_export_bytes(rows),
+                f"模具信息_{date.today().strftime('%Y%m%d')}.xlsx",
+                mime=_XLSX_MIME, disabled=not rows, key="dl_all")
+
+        st.divider()
+        st.markdown("#### ⬆️ 批量上传")
+        st.caption("按「模具编号」匹配：已存在则更新（不改累计模次），不存在则新增。"
+                   "逐行校验，问题行会列出原因、其余正常导入。")
+        up = st.file_uploader("选择 Excel 文件（.xlsx）", type=["xlsx"], key="mold_upload")
+        if up is not None:
+            try:
+                df_up = mold_io.parse_upload(up)
+            except Exception as e:  # 文件损坏/格式非法
+                st.error(f"❌ 文件解析失败：{e}")
+                df_up = None
+
+            if df_up is not None:
+                st.write(f"已读取 **{len(df_up)}** 行，预览前 5 行：")
+                st.dataframe(df_up.head(5), use_container_width=True, hide_index=True)
+                if st.button("🚀 开始导入", type="primary", key="do_import"):
+                    statuses, locations, types, users_raw = _load_or_stop(load_lookup_data)
+                    lookups = {
+                        'type': {t['type_name']: t['type_id'] for t in types},
+                        'status': {s['status_name']: s['status_id'] for s in statuses},
+                        'location': {l['location_name']: l['location_id'] for l in locations},
+                        'user': {u['full_name']: u['user_id'] for u in users_raw},
+                    }
+                    res = mold_io.import_molds(df_up, lookups, execute_query)
+                    log_user_action(
+                        'IMPORT_MOLDS', 'molds',
+                        f"created={res['created']},updated={res['updated']},errors={len(res['errors'])}")
+                    st.success(f"✅ 导入完成：新增 {res['created']} 条，更新 {res['updated']} 条，"
+                               f"失败 {len(res['errors'])} 条。")
+                    if res['errors']:
+                        st.markdown("**未导入的行：**")
+                        st.dataframe(
+                            pd.DataFrame(res['errors'], columns=["行号", "原因"]),
+                            use_container_width=True, hide_index=True)
+                    st.cache_data.clear()

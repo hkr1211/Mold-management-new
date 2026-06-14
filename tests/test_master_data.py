@@ -74,6 +74,7 @@ def _load_module():
     ui.inject_global_css = lambda: None
     ui.page_header = lambda *a, **kw: None
     ui.download_csv_button = lambda *a, **kw: None
+    ui.render_qr_label = lambda *a, **kw: None
     sys.modules["utils.ui"] = ui
 
     nav = types.ModuleType("utils.nav")

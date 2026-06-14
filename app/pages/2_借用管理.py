@@ -197,6 +197,16 @@ def create_loan_application():
         st.warning("请先登录系统。")
         return
 
+    # 从模具列表"借用"按钮跳转而来：预选模具
+    pre_mold_id = st.session_state.pop('preselect_loan_mold_id', None)
+    if pre_mold_id:
+        info = get_mold_details(pre_mold_id)
+        if info:
+            st.session_state.selected_mold_id = pre_mold_id
+            st.session_state.selected_mold_info = dict(info)
+        else:
+            st.warning("预选模具信息获取失败，请手动搜索。")
+
     # 模具搜索区域
     st.markdown("#### 🔍 搜索并选择模具")
     

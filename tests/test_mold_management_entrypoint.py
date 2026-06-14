@@ -52,6 +52,9 @@ def _build_st_mock(session_state: dict) -> types.ModuleType:
     st.cache_data = lambda **kw: (lambda f: f)
     st.cache_data.clear = lambda: None
     st.rerun = lambda: None
+    st.download_button = lambda *a, **kw: None
+    st.file_uploader = lambda *a, **kw: None
+    st.container = lambda *a, **kw: _DummyContext(st)
     return st
 
 
@@ -75,6 +78,7 @@ def _load_page(st_mock, has_permission=None):
     ui.inject_global_css = lambda: None
     ui.page_header = lambda *a, **kw: None
     ui.download_csv_button = lambda *a, **kw: None
+    ui.render_qr_label = lambda *a, **kw: None
     sys.modules["utils.ui"] = ui
 
     database = types.ModuleType("utils.database")
