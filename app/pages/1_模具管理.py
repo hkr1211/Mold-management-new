@@ -11,6 +11,7 @@ from utils.database import (
 )
 from utils.auth import has_permission, log_user_action, restore_session
 from utils.ui import inject_global_css, page_header, download_csv_button, render_qr_label
+from utils import mold_io
 from utils.nav import setup_sidebar
 
 logging.basicConfig(level=logging.INFO)
@@ -335,7 +336,8 @@ def _last_maintenance_strokes(mold_id):
 
 # --- 主页面 ---
 
-tab1, tab2, tab3, tab4 = st.tabs(["📋 模具列表", "➕ 新增模具", "✏️ 编辑模具", "📜 模具履历"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📋 模具列表", "➕ 新增模具", "✏️ 编辑模具", "📜 模具履历", "📦 批量导入/导出"])
 
 # ========== TAB1：模具列表 ==========
 with tab1:
@@ -657,3 +659,65 @@ with tab4:
                                  use_container_width=True)
                 else:
                     st.caption("暂无流水")
+
+# ========== TAB5：批量导入/导出 ==========
+with tab5:
+    _XLSX_MIME = "application/vnd.openpyxl-spreadsheetml.sheet"
+    if not has_permission('manage_molds'):
+        st.warning("🔒 您的角色没有批量导入/导出模具的权限。")
+    else:
+        st.markdown("#### ⬇️ 下载")
+        st.caption("「空模板」仅含表头，供按格式填写；「导出全部」含现有模具数据，"
+                   "可改后再导回。带 * 列为必填；功能类型/状态/存放位置/负责人按"
+                   "**名称**填写，需与主数据一致。")
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "📄 下载空模板（仅表头）", mold_io.build_template_bytes(),
+                "模具导入模板.xlsx", mime=_XLSX_MIME, key="dl_tpl")
+        with d2:
+            try:
+                rows = execute_query(mold_io.export_query(), fetch_all=True) or []
+            except sqlite3.Error as e:
+                rows = []
+                st.error(f"导出数据加载失败：{e}")
+            st.download_button(
+                f"📦 导出全部模具（{len(rows)} 条）", mold_io.build_export_bytes(rows),
+                f"模具信息_{date.today().strftime('%Y%m%d')}.xlsx",
+                mime=_XLSX_MIME, disabled=not rows, key="dl_all")
+
+        st.divider()
+        st.markdown("#### ⬆️ 批量上传")
+        st.caption("按「模具编号」匹配：已存在则更新（不改累计模次），不存在则新增。"
+                   "逐行校验，问题行会列出原因、其余正常导入。")
+        up = st.file_uploader("选择 Excel 文件（.xlsx）", type=["xlsx"], key="mold_upload")
+        if up is not None:
+            try:
+                df_up = mold_io.parse_upload(up)
+            except Exception as e:  # 文件损坏/格式非法
+                st.error(f"❌ 文件解析失败：{e}")
+                df_up = None
+
+            if df_up is not None:
+                st.write(f"已读取 **{len(df_up)}** 行，预览前 5 行：")
+                st.dataframe(df_up.head(5), use_container_width=True, hide_index=True)
+                if st.button("🚀 开始导入", type="primary", key="do_import"):
+                    statuses, locations, types, users_raw = _load_or_stop(load_lookup_data)
+                    lookups = {
+                        'type': {t['type_name']: t['type_id'] for t in types},
+                        'status': {s['status_name']: s['status_id'] for s in statuses},
+                        'location': {l['location_name']: l['location_id'] for l in locations},
+                        'user': {u['full_name']: u['user_id'] for u in users_raw},
+                    }
+                    res = mold_io.import_molds(df_up, lookups, execute_query)
+                    log_user_action(
+                        'IMPORT_MOLDS', 'molds',
+                        f"created={res['created']},updated={res['updated']},errors={len(res['errors'])}")
+                    st.success(f"✅ 导入完成：新增 {res['created']} 条，更新 {res['updated']} 条，"
+                               f"失败 {len(res['errors'])} 条。")
+                    if res['errors']:
+                        st.markdown("**未导入的行：**")
+                        st.dataframe(
+                            pd.DataFrame(res['errors'], columns=["行号", "原因"]),
+                            use_container_width=True, hide_index=True)
+                    st.cache_data.clear()

@@ -52,6 +52,9 @@ def _build_st_mock(session_state: dict) -> types.ModuleType:
     st.cache_data = lambda **kw: (lambda f: f)
     st.cache_data.clear = lambda: None
     st.rerun = lambda: None
+    st.download_button = lambda *a, **kw: None
+    st.file_uploader = lambda *a, **kw: None
+    st.container = lambda *a, **kw: _DummyContext(st)
     return st
 
 
