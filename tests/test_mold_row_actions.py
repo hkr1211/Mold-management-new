@@ -28,12 +28,15 @@ class _Ctx:
     def __getattr__(self, n): return getattr(self._st, n)
 
 
-def _load(true_button_key):
+def _load(true_button_key, extra_state=None):
     """加载模具页，让 key==true_button_key 的按钮返回 True，捕获 switch_page。"""
     st = types.ModuleType("streamlit")
     st.session_state = {"logged_in": True, "user_role": "超级管理员", "user_id": 1}
+    if extra_state:
+        st.session_state.update(extra_state)
     st._switched = []
     st._reran = []
+    st._forms = []
 
     for n in ("error", "warning", "info", "success", "markdown", "plotly_chart",
               "progress", "divider", "metric", "subheader", "caption", "dataframe",
@@ -50,7 +53,8 @@ def _load(true_button_key):
         len(spec) if isinstance(spec, (list, tuple)) else spec)]
     st.tabs = lambda labels: [_Ctx(st) for _ in labels]
     st.expander = lambda *a, **kw: _Ctx(st)
-    st.form = lambda *a, **kw: _Ctx(st)
+    st.container = lambda *a, **kw: _Ctx(st)
+    st.form = lambda *a, **kw: (st._forms.append(a[0] if a else kw.get("key")), _Ctx(st))[1]
     st.cache_data = lambda **kw: (lambda f: f)
     st.cache_data.clear = lambda: None
     st.rerun = lambda: st._reran.append(True)
@@ -134,3 +138,9 @@ def test_maintenance_button_preselects_and_navigates():
     assert st.session_state.get("create_maintenance_mold_id") == 7
     assert st.session_state.get("maintenance_tab") == "create_task"
     assert any("3_" in p for p in st._switched)  # 跳转维修页
+
+
+def test_edit_code_set_renders_inline_editor():
+    """预设 edit_mold_code（模拟点击编辑后）应在列表页就地展开编辑表单，无需切标签。"""
+    st = _load("none", extra_state={"edit_mold_code": "MD-007"})
+    assert "inline_mold_form" in st._forms  # 行内编辑表单已渲染
